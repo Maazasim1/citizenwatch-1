@@ -1,0 +1,22 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgis/postgis:15-3.4
+    ports:
+      # Avoid clashing with any local Postgres already bound to 5432 on the host.
+      - "5433:5432"
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: citizenwatch-db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: always
+
+  redis:
+    image: redis:7-alpine
+    restart: always
+
+volumes:
+  postgres_data:

@@ -1,0 +1,26 @@
+fir_number,date,crime_type,description,latitude,longitude,police_station,district
+FIR-2024-001,2024-01-15,ARMED_ROBBERY,Armed robbery at mobile shop near Saddar - two suspects on motorcycle fled towards Tower area,24.8562,67.0099,Preedy,South
+FIR-2024-002,2024-01-18,VEHICLE_CRIME,Car stolen from parking lot near PIDC - white Toyota Corolla 2019 model,24.8527,67.0310,Artillery Maidan,Cantonment
+FIR-2024-003,2024-01-22,ASSAULT,Street fight between two groups near Empress Market - 3 injured,24.8610,67.0050,Saddar,South
+FIR-2024-004,2024-02-01,THEFT,Mobile snatching near Jinnah Hospital bus stop - suspect on Honda 125,24.8663,67.0001,Civil Lines,South
+FIR-2024-005,2024-02-05,ARMED_ROBBERY,Armed robbery at jewelry shop in Hyderi - 2 armed suspects,24.9302,67.0575,Hyderi,Central
+FIR-2024-006,2024-02-10,VANDALISM,Public property damage near Numaish Chowrangi during protest,24.8726,67.0398,Garden,East
+FIR-2024-007,2024-02-14,VEHICLE_CRIME,Motorcycle theft from university parking - Yamaha YBR 2022,24.8607,67.0011,Gulshan-e-Iqbal,East
+FIR-2024-008,2024-02-20,ASSAULT,Mugging attempt near Tariq Road - victim resisted and was injured,24.8740,67.0620,Ferozabad,East
+FIR-2024-009,2024-03-01,ARMED_ROBBERY,Dacoity at residential house in Defence Phase 5 - family held at gunpoint,24.8150,67.0540,Defence,South
+FIR-2024-010,2024-03-05,THEFT,Pickpocketing ring active near Tower area - multiple complaints same week,24.8580,67.0080,Napier,South
+FIR-2024-011,2024-03-10,ASSAULT,Road rage incident on Shahrah-e-Faisal near Nursery - driver assaulted,24.8700,67.0800,Bahadurabad,East
+FIR-2024-012,2024-03-15,VEHICLE_CRIME,Carjacking on University Road near Jail Chowrangi - Suzuki Alto taken,24.8900,67.0750,Gulzar-e-Hijri,East
+FIR-2024-013,2024-03-20,ARMED_ROBBERY,ATM robbery at Bank Al Habib near Clifton Block 5,24.8270,67.0290,Clifton,South
+FIR-2024-014,2024-03-25,VANDALISM,Shop windows broken during overnight disturbance in Lyari,24.8700,66.9900,Lyari,South
+FIR-2024-015,2024-04-01,THEFT,Laptop stolen from cafe in Zamzama commercial area,24.8130,67.0430,Clifton,South
+FIR-2024-016,2024-04-05,ASSAULT,Domestic violence case reported in North Nazimabad Block H,24.9400,67.0350,North Nazimabad,Central
+FIR-2024-017,2024-04-10,ARMED_ROBBERY,Armed robbery at pharmacy in Gulshan Block 13 - cash and medicines looted,24.9200,67.0900,Gulshan,East
+FIR-2024-018,2024-04-15,VEHICLE_CRIME,Two-wheeler theft from Dolmen Mall parking - Honda CD 70,24.8230,67.0350,Clifton,South
+FIR-2024-019,2024-04-20,THEFT,Wallet snatching near Cantt Station platform 2,24.8510,67.0230,Saddar,Cantonment
+FIR-2024-020,2024-04-25,ASSAULT,Group assault near Liaquatabad No. 10 bus stop - gang-related,24.9000,67.0200,Liaquatabad,Central
+FIR-2024-021,2024-05-01,ARMED_ROBBERY,Bank robbery attempt at MCB Nazimabad - suspect apprehended,24.9300,67.0300,Nazimabad,Central
+FIR-2024-022,2024-05-05,VANDALISM,Street lights destroyed in Orangi Town Sector 11,24.9500,66.9700,Orangi,West
+FIR-2024-023,2024-05-10,VEHICLE_CRIME,Car theft from residential area in Malir Cantt,24.8900,67.1800,Malir Cantt,Malir
+FIR-2024-024,2024-05-15,THEFT,Chain snatching near Karachi Zoo main gate,24.8750,67.0350,Garden,East
+FIR-2024-025,2024-05-20,ASSAULT,Security guard assaulted at commercial plaza in I.I. Chundrigar Road,24.8460,67.0050,Mithadar,South

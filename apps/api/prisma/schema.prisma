@@ -1,0 +1,416 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
+// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  extensions = [postgis]
+}
+
+model User {
+  id        String   @id @default(uuid())
+  email     String?  @unique
+  phone     String?  @unique
+  password  String
+  role      Role     @default(CITIZEN)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  otpCode      String?
+  otpExpiresAt DateTime?
+  otpVerified  Boolean  @default(false)
+
+  // Full profile fields (all roles)
+  fullName          String?
+  age               Int?
+  sex               Sex      @default(UNDISCLOSED)
+  avatarUrl         String?
+  notificationPrefs Json?
+
+  /// Set when the user casts many more DISPUTE than CONFIRM votes (abuse heuristic).
+  voteAbuseFlaggedAt DateTime?
+
+  /// When false, user will not receive nearby-incident witness prompts (Feature 2).
+  witnessNotificationsEnabled Boolean @default(true)
+  /// Optional “alert point” used only for witness prompts (not live GPS). Must be set to receive nearby prompts.
+  witnessAlertLatitude  Float?
+  witnessAlertLongitude Float?
+
+  /// Silent per-user credibility (Feature 5).
+  credibilityScore      Int             @default(50)
+  credibilityTier       CredibilityTier @default(STANDARD)
+  /// Last activity used for inactivity decay (score floor=30 when applying inactivity penalties).
+  lastActivityAt        DateTime?       @default(now())
+  /// Daily authenticated report counters (reset at UTC day boundary).
+  dailyReportCount      Int             @default(0)
+  dailyReportResetAt    DateTime?       @default(now())
+
+  reports Report[]
+  moderationAudits ModerationAudit[]
+  sessions Session[]
+  notifications Notification[]
+  reportVotes ReportVote[]
+  witnessInvites WitnessCorroboration[] @relation("WitnessInvites")
+
+  reportsResolvedAsOfficer Report[]       @relation("ReportResolvedBy")
+  resolutionHistoryActs   ResolutionHistory[] @relation("ResolutionActor")
+  credibilityEvents       CredibilityEvent[]
+}
+
+enum Sex {
+  MALE
+  FEMALE
+  UNDISCLOSED
+}
+
+enum Role {
+  CITIZEN
+  MODERATOR
+  LAW_ENFORCEMENT
+  ADMIN
+}
+
+model Report {
+  id          String @id @default(uuid())
+  title       String
+  description String
+  type        String
+
+  // Geospatial data
+  latitude  Float
+  longitude Float
+  // Note: in a real implementation we'd use raw PostGIS geometry types here 
+  // with Prisma's raw queries or extensions, but we'll stick to float for basic storage
+
+  severity Int? // 1-10 (assigned when status becomes VERIFIED)
+  severityConfidence Float? // model confidence 0-1 for the assigned severity
+  status   ReportStatus @default(PENDING)
+
+  /// Set when the report first becomes VERIFIED (for resolution SLA stats).
+  verifiedAt DateTime?
+
+  /// Law-enforcement resolution (Feature 3): verified incidents cleared from default risk/map while true.
+  isResolved           Boolean         @default(false)
+  resolutionTag        ResolutionTag?
+  resolvedAt           DateTime?
+  resolvedById         String?
+  resolvedBy           User?           @relation("ReportResolvedBy", fields: [resolvedById], references: [id])
+  resolutionNotes      String?
+
+  // Data source tagging (FR-23) — distinguishes citizen reports from historical/media/cctv
+  dataSource DataSource @default(CITIZEN)
+  firNumber  String?    // For historical FIR imports
+
+  // Suspect photo isolation (FR-51–FR-59, Section 7.10)
+  hasSuspectPhoto Boolean @default(false)
+
+  authorId String
+  author   User   @relation(fields: [authorId], references: [id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  multimedia Multimedia[]
+
+  isDuplicate   Boolean @default(false)
+  duplicateOfId String?
+  duplicateOf   Report?  @relation("DuplicateReports", fields: [duplicateOfId], references: [id])
+  duplicates    Report[] @relation("DuplicateReports")
+
+  /// Net community votes: confirms − disputes (denormalized).
+  voteScore            Int     @default(0)
+  /// True while net score ≥ 10 (not an auto-verify).
+  communityConfirmed   Boolean @default(false)
+
+  moderationAudits ModerationAudit[]
+  notifications Notification[]
+  suspectPhotoReviews SuspectPhotoReview[]
+  votes              ReportVote[]
+  witnessCorroborations WitnessCorroboration[]
+  resolutionHistory     ResolutionHistory[]
+  credibilityEvents      CredibilityEvent[]
+
+  /// Last time a witness prompt was sent for this report (denormalized).
+  notificationSentAt DateTime?
+  /// Number of witness prompts successfully queued for this report.
+  notificationCount  Int      @default(0)
+}
+
+enum CredibilityTier {
+  TRUSTED
+  STANDARD
+  FLAGGED
+  RESTRICTED
+}
+
+enum ResolutionTag {
+  ARREST_MADE
+  SUSPECTS_DISPERSED
+  SITUATION_CLEARED
+  FALSE_ALARM
+  DUPLICATE_CONFIRMED
+  UNDER_INVESTIGATION
+  NO_ACTION_TAKEN
+}
+
+enum ResolutionHistoryAction {
+  RESOLVED
+  REOPENED
+}
+
+model ResolutionHistory {
+  id        String   @id @default(uuid())
+  reportId  String
+  report    Report   @relation(fields: [reportId], references: [id], onDelete: Cascade)
+  action    ResolutionHistoryAction
+  actorId   String
+  actor     User     @relation("ResolutionActor", fields: [actorId], references: [id], onDelete: Restrict)
+  tag       ResolutionTag?
+  notes     String?
+  createdAt DateTime @default(now())
+
+  @@index([reportId, createdAt])
+}
+
+model CredibilityEvent {
+  id                  String   @id @default(uuid())
+  userId              String
+  user                User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  delta               Int
+  reason              String
+  triggeredByReportId String?
+  triggeredByReport   Report?  @relation(fields: [triggeredByReportId], references: [id], onDelete: SetNull)
+  createdAt           DateTime @default(now())
+
+  @@index([userId, createdAt])
+  @@index([triggeredByReportId])
+}
+
+enum DataSource {
+  CITIZEN
+  MEDIA
+  HISTORICAL
+  CCTV_DERIVED
+}
+
+enum ReportStatus {
+  PENDING
+  VERIFIED
+  REJECTED
+  ESCALATED
+}
+
+enum VoteType {
+  CONFIRM
+  DISPUTE
+}
+
+/// One row per user per report (vote change = update; removal = DELETE).
+model ReportVote {
+  id        String   @id @default(uuid())
+  reportId  String
+  report    Report   @relation(fields: [reportId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  voteType  VoteType
+  /// Voter-declared location at time of vote (optional when no proximity gate / unknown voter location).
+  voteLat   Float?
+  voteLng   Float?
+  voterIp   String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([reportId, userId])
+  @@index([voterIp, createdAt])
+}
+
+/// One row per POST /reports/:id/vote attempt (for IP rate limiting).
+model CommunityVoteAction {
+  id        String   @id @default(uuid())
+  ip        String
+  createdAt DateTime @default(now())
+
+  @@index([ip, createdAt])
+}
+
+model Multimedia {
+  id        String    @id @default(uuid())
+  url       String
+  type      MediaType
+  reportId  String
+  report    Report    @relation(fields: [reportId], references: [id])
+  createdAt DateTime  @default(now())
+}
+
+model ModerationAudit {
+  id        String @id @default(uuid())
+
+  reportId  String
+  report    Report @relation(fields: [reportId], references: [id], onDelete: Cascade)
+
+  actorId   String
+  actor     User @relation(fields: [actorId], references: [id], onDelete: Restrict)
+
+  // The report status that resulted from the moderation action.
+  actionStatus ReportStatus
+
+  // PRD requires a mandatory reason note for each moderation decision.
+  reason String
+
+  createdAt DateTime @default(now())
+}
+
+model Session {
+  id String @id @default(uuid())
+
+  // Stored token identifier ("jti") so we can invalidate sessions on logout.
+  tokenId String @unique
+
+  userId String
+  user   User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  lastActivityAt DateTime @default(now())
+  revokedAt DateTime?
+}
+
+enum MediaType {
+  IMAGE
+  VIDEO
+}
+
+model Notification {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  reportId  String?
+  report    Report?  @relation(fields: [reportId], references: [id], onDelete: SetNull)
+  message   String
+  type      NotificationType @default(GENERAL)
+  isRead    Boolean  @default(false)
+  createdAt DateTime @default(now())
+}
+
+enum NotificationType {
+  STATUS_UPDATE
+  GENERAL
+  WITNESS_PROMPT
+}
+
+/// Nearby-user witness workflow: invite row created when notification is sent; vote only after response before expiry.
+enum WitnessResponse {
+  CORROBORATED
+  DISPUTED
+}
+
+model WitnessCorroboration {
+  id            String   @id @default(uuid())
+  reportId      String
+  report        Report   @relation(fields: [reportId], references: [id], onDelete: Cascade)
+  witnessUserId String
+  witness       User     @relation("WitnessInvites", fields: [witnessUserId], references: [id], onDelete: Cascade)
+  /// Null until the witness answers; unanswered after `expiresAt` is discarded for voting purposes.
+  response      WitnessResponse?
+  note          String?
+  invitedAt     DateTime @default(now())
+  expiresAt     DateTime
+  respondedAt   DateTime?
+
+  @@unique([reportId, witnessUserId])
+  @@index([witnessUserId, invitedAt])
+}
+
+// ── Feature 2: CCTV Person Detection ────────────────────────────────
+
+model CctvDetection {
+  id          String   @id @default(uuid())
+  sourceFile  String   // original footage filename
+  frameIndex  Int?     // which video frame the detection came from
+  personCrop  String   // path/URL to cropped person image
+  confidence  Float    // YOLOv8 detection confidence 0-1
+  boundingBox String   // JSON: {x, y, w, h}
+  latitude    Float?   // location of the camera
+  longitude   Float?
+  detectedAt  DateTime @default(now())
+
+  faceMatches FaceMatch[]
+}
+
+// ── Feature 3: Facial Embeddings / Criminal Database ────────────────
+
+model CriminalRecord {
+  id          String   @id @default(uuid())
+  name        String
+  firNumber   String?
+  mugshotUrl  String   // URL to stored mugshot
+  embeddingId String?  // reference key to numpy embedding store on Python side
+  notes       String?
+  sampleCount Int      @default(0) // number of LBPH training samples
+  addedById   String?  // law enforcement user who added
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  faceMatches FaceMatch[]
+}
+
+model FaceMatch {
+  id              String   @id @default(uuid())
+  criminalId      String
+  criminal        CriminalRecord @relation(fields: [criminalId], references: [id])
+  detectionId     String?
+  detection       CctvDetection? @relation(fields: [detectionId], references: [id])
+  detectionSource MatchSource    @default(CCTV)
+  confidence      Float          // cosine similarity 0-1 or LBPH distance
+  latitude        Float?
+  longitude       Float?
+  spottedAt       DateTime?      // when criminal was spotted in live feed
+  frameSnapshot   String?        // path to frame where match occurred
+  reviewStatus    MatchReviewStatus @default(PENDING_REVIEW)
+  reviewedById    String?
+  reviewedAt      DateTime?
+  reviewNote      String?
+  createdAt       DateTime @default(now())
+}
+
+enum MatchSource {
+  CCTV
+  CITIZEN_PHOTO
+}
+
+enum MatchReviewStatus {
+  PENDING_REVIEW
+  CONFIRMED
+  DISMISSED
+}
+
+// ── Feature 4: Suspect Photo Isolation ──────────────────────────────
+
+model SuspectPhotoReview {
+  id            String   @id @default(uuid())
+  reportId      String
+  report        Report   @relation(fields: [reportId], references: [id], onDelete: Cascade)
+  multimediaId  String   // which multimedia attachment contains the face
+  isolatedPath  String   // path to isolated copy of the photo
+  status        SuspectReviewStatus @default(PENDING_REVIEW)
+  reviewedById  String?
+  reviewedAt    DateTime?
+  matchResults  String?  // JSON: array of match results from criminal DB
+  createdAt     DateTime @default(now())
+}
+
+enum SuspectReviewStatus {
+  PENDING_REVIEW
+  SUBMITTED_FOR_MATCHING
+  MATCHED
+  NO_MATCH
+  ARCHIVED
+}
+
