@@ -1,16 +1,12 @@
 """
 Face Detection & Recognition Engine
-Uses OpenCV Haar cascades for detection + LBPH Face Recognizer for identification.
-Modeled after the example projects' architecture:
-  - face_samples/{person_name}/*.png  for training data
-  - LBPHFaceRecognizer for real-time recognition
-  - Haar cascades for face detection
-
-Also retains the criminal database JSON for the existing CCTV upload workflow.
+Uses modern identity embeddings (ArcFace + ReID) for identification and matching.
+Haar cascades remain for lightweight face localization in low-resource environments.
 """
 
 import os
 import json
+import threading
 import uuid
 import shutil
 import cv2
@@ -23,8 +19,84 @@ from identity_models import (
     compute_arcface_embedding,
     compute_reid_embedding,
     cosine_similarity as identity_cosine_similarity,
+    detect_arcface_faces,
     get_identity_backend_status,
 )
+from person_motion_tracker import reset_motion_tracker, update_motion_tracks
+from tracker import VoteObservation, get_identity_store
+
+# Identity + BoxMOT motion state resets together when galleries change.
+_global_reid_lock = threading.Lock()
+_global_reid_cache: list[dict] = []
+_cam_frame_lock = threading.Lock()
+_camera_frame_counters: dict[str, int] = {}
+
+
+def _next_frame_no(camera_id: str) -> int:
+    with _cam_frame_lock:
+        n = _camera_frame_counters.get(camera_id, 0) + 1
+        _camera_frame_counters[camera_id] = n
+        return n
+
+
+def _global_reid_cache_sweep() -> None:
+    import time
+    now = time.monotonic()
+    with _global_reid_lock:
+        _global_reid_cache[:] = [e for e in _global_reid_cache if e["expires"] > now]
+
+
+def _global_reid_lookup(body_emb: np.ndarray | None) -> tuple[str, float] | None:
+    if body_emb is None:
+        return None
+    min_sim = float(os.environ.get("GLOBAL_REID_MATCH_MIN", "0.78"))
+    import time
+    _global_reid_cache_sweep()
+    with _global_reid_lock:
+        best_n: str | None = None
+        best_s = min_sim
+        for e in _global_reid_cache:
+            s = float(identity_cosine_similarity(body_emb, e["emb"]))
+            if s > best_s:
+                best_s = s
+                best_n = e["name"]
+        if best_n:
+            return best_n, best_s
+    return None
+
+
+def _push_global_reid(name: str, body_emb: np.ndarray | None) -> None:
+    if body_emb is None or not name:
+        return
+    import time
+    ttl = float(os.environ.get("GLOBAL_REID_CACHE_TTL_SEC", "300"))
+    maxn = int(os.environ.get("GLOBAL_REID_CACHE_MAX", "80"))
+    with _global_reid_lock:
+        _global_reid_cache_sweep()
+        _global_reid_cache.append(
+            {"name": name, "emb": body_emb.astype(np.float32), "expires": time.monotonic() + ttl}
+        )
+        while len(_global_reid_cache) > maxn:
+            _global_reid_cache.pop(0)
+
+
+def reset_person_trackers(camera_id: str | None = None) -> None:
+    reset_motion_tracker(camera_id)
+    st = get_identity_store()
+    if camera_id is None:
+        st.reset_all()
+    else:
+        st.reset_camera(camera_id)
+    with _cam_frame_lock:
+        if camera_id is None:
+            _camera_frame_counters.clear()
+        else:
+            _camera_frame_counters.pop(camera_id, None)
+
+
+def reset_face_tracker(camera_id: str | None = None) -> None:
+    """Backward-compatible alias for gallery refresh hooks."""
+    reset_person_trackers(camera_id)
 
 CRIMINAL_DB_DIR = os.path.join(os.path.dirname(__file__), "criminal_db")
 EMBEDDINGS_FILE = os.path.join(CRIMINAL_DB_DIR, "embeddings.json")
@@ -36,18 +108,14 @@ os.makedirs(FACE_SAMPLES_DIR, exist_ok=True)
 _face_cascade = None
 _profile_cascade = None
 
-# Global LBPH model (lazy-trained)
-_lbph_model = None
-_lbph_names = {}
 _model_trained = False
 _subject_embedding_gallery = {}
 _subject_reid_gallery = {}
+_trained_subject_names = {}
 
-# Standard face size for LBPH training (matches example projects)
+DETECTION_SCALE = 2
 FACE_WIDTH = 112
 FACE_HEIGHT = 92
-DETECTION_SCALE = 2
-LBPH_MATCH_THRESHOLD = 86.0
 HISTOGRAM_MATCH_THRESHOLD = 0.78
 HISTOGRAM_STRONG_MATCH_THRESHOLD = 0.84
 ARCFACE_MATCH_THRESHOLD = float(os.environ.get("ARCFACE_MATCH_THRESHOLD", "0.5"))
@@ -56,6 +124,124 @@ REID_MATCH_THRESHOLD = float(os.environ.get("REID_MATCH_THRESHOLD", "0.72"))
 REID_STRONG_MATCH_THRESHOLD = float(os.environ.get("REID_STRONG_MATCH_THRESHOLD", "0.82"))
 EMBEDDING_TOP2_MARGIN = 0.02
 LIVE_PERSON_DETECTION_THRESHOLD = float(os.environ.get("LIVE_PERSON_DETECTION_THRESHOLD", "0.45"))
+VERBOSE_RECOGNITION_LOGS = os.environ.get("VERBOSE_RECOGNITION_LOGS", "1").lower() in {"1", "true", "yes", "on"}
+ALERT_MIN_TRACK_AGE = int(os.environ.get("ALERT_MIN_TRACK_AGE", "20"))
+ALERT_MIN_LOCKED_CONF = float(os.environ.get("ALERT_MIN_LOCKED_CONF", "0.72"))
+ALERT_MIN_FACE_FRAMES = int(os.environ.get("ALERT_MIN_FACE_FRAMES", "2"))
+LOCK_WEIGHT_THRESHOLD = float(os.environ.get("TRACKER_LOCK_WEIGHT_THRESHOLD", "5.0"))
+LOCK_MIN_AVG_CONF = float(os.environ.get("TRACKER_LOCK_MIN_AVG_CONF", "0.62"))
+IDENTITY_MAX_MISSED = int(os.environ.get("IDENTITY_MAX_MISSED_FRAMES", "90"))
+
+
+def _xyxy_to_xywh(x1: int, y1: int, x2: int, y2: int) -> tuple[int, int, int, int]:
+    return x1, y1, max(0, x2 - x1), max(0, y2 - y1)
+
+
+def _face_quality_factor(fw: int, fh: int) -> float:
+    area = max(1, fw * fh)
+    ref = 96 * 96
+    return float(min(1.0, np.sqrt(area / ref)))
+
+
+def _assemble_person_detections(
+    frame: np.ndarray,
+    yolo_dets: list,
+    arcface_faces: list,
+) -> tuple[list[dict], list[dict | None]]:
+    """
+    YOLO person boxes + synthetic full-person boxes for faces YOLO missed.
+    Returns parallel lists: ultralytics-style detections, meta (face_idx or None).
+    """
+    H, W = frame.shape[:2]
+    detections: list[dict] = []
+    meta: list[dict] = []
+    for d in yolo_dets:
+        detections.append(d)
+        meta.append({"face_idx": None, "from_yolo": True})
+    used_faces: set[int] = set()
+    for pi in range(len(detections)):
+        box = detections[pi]["bounding_box"]
+        px, py, pw, ph = int(box["x"]), int(box["y"]), int(box["w"]), int(box["h"])
+        pb = (px, py, pw, ph)
+        best_fi: int | None = None
+        best_score = -1.0
+        for fi, face in enumerate(arcface_faces):
+            if fi in used_faces:
+                continue
+            fb = face["bbox"]
+            iou = _iou(pb, fb)
+            cx = fb[0] + fb[2] / 2
+            cy = fb[1] + fb[3] / 2
+            inside = px <= cx <= px + pw and py <= cy <= py + ph
+            score = iou + (0.15 if inside else 0.0)
+            if score > best_score:
+                best_score = score
+                best_fi = fi
+        if best_fi is not None and best_score >= 0.06:
+            used_faces.add(best_fi)
+            meta[pi]["face_idx"] = best_fi
+    for fi, face in enumerate(arcface_faces):
+        if fi in used_faces:
+            continue
+        fb = face["bbox"]
+        fx, fy, fw, fh = int(fb[0]), int(fb[1]), int(fb[2]), int(fb[3])
+        body_h = min(H - fy, max(fh * 3, int(fh * 2.5)))
+        body_w = min(W, max(fw, int(fw * 1.3)))
+        bx = max(0, int(fx + (fw - body_w) / 2))
+        by = fy
+        if body_h <= 0 or body_w <= 0:
+            continue
+        detections.append({
+            "confidence": 0.55,
+            "bounding_box": {"x": bx, "y": by, "w": body_w, "h": body_h},
+        })
+        meta.append({"face_idx": fi, "from_yolo": False})
+    return detections, meta
+
+
+def _match_detection_to_track_meta(
+    tx1: int, ty1: int, tx2: int, ty2: int,
+    detections: list[dict],
+) -> int:
+    """Index of YOLO/synth box best matching this track (xyxy), or 0."""
+    best_j = 0
+    best_iou = 0.0
+    for j, det in enumerate(detections):
+        b = det["bounding_box"]
+        px, py, pw, ph = int(b["x"]), int(b["y"]), int(b["w"]), int(b["h"])
+        iou = _iou((tx1, ty1, tx2 - tx1, ty2 - ty1), (px, py, pw, ph))
+        if iou > best_iou:
+            best_iou = iou
+            best_j = j
+    return best_j
+
+
+def _face_vote_from_embedding(query_embedding: dict | None) -> tuple[str | None, float, bool]:
+    if not query_embedding or not _subject_embedding_gallery:
+        return None, 0.0, False
+    best_name, best_sim, second_best_sim = _best_gallery_match(query_embedding, _subject_embedding_gallery)
+    embedding_threshold, embedding_strong_threshold = _face_threshold_for_model(_entry_model(query_embedding))
+    emb_name: str | None = None
+    emb_conf = 0.0
+    if best_name is not None and best_sim >= embedding_threshold:
+        emb_name = best_name
+        emb_conf = float(best_sim)
+    emb_margin_ok = second_best_sim > 0.0 and (best_sim - second_best_sim) >= EMBEDDING_TOP2_MARGIN
+    acceptable = emb_name is not None and (emb_conf >= embedding_strong_threshold or emb_margin_ok)
+    return emb_name, emb_conf, acceptable
+
+
+def _body_vote_from_embedding(query_reid: dict | None) -> tuple[str | None, float, bool]:
+    if not query_reid or not _subject_reid_gallery:
+        return None, 0.0, False
+    best_name, best_sim, second_best_sim = _best_gallery_match(query_reid, _subject_reid_gallery)
+    margin_ok = second_best_sim > 0.0 and (best_sim - second_best_sim) >= EMBEDDING_TOP2_MARGIN
+    acceptable = (
+        best_name is not None
+        and best_sim >= REID_MATCH_THRESHOLD
+        and (best_sim >= REID_STRONG_MATCH_THRESHOLD or margin_ok)
+    )
+    return best_name, float(best_sim), acceptable
 
 
 def _embedding_to_entry(embedding: IdentityEmbedding | np.ndarray | None, fallback_model: str = "opencv_histogram_v1"):
@@ -84,6 +270,13 @@ def _face_threshold_for_model(model_name: str) -> tuple[float, float]:
     if model_name.startswith("insightface:"):
         return ARCFACE_MATCH_THRESHOLD, ARCFACE_STRONG_MATCH_THRESHOLD
     return HISTOGRAM_MATCH_THRESHOLD, HISTOGRAM_STRONG_MATCH_THRESHOLD
+
+
+def _log_recognition_decision(method: str, name: str, confidence: float, details: str = ""):
+    if not VERBOSE_RECOGNITION_LOGS:
+        return
+    suffix = f" | {details}" if details else ""
+    print(f"[FaceEngine] method={method} name={name} confidence={confidence:.4f}{suffix}")
 
 
 def _best_gallery_match(query_entry, gallery: dict):
@@ -244,263 +437,266 @@ def has_human_face(image_path: str) -> bool:
     return result.get("face_count", 0) > 0
 
 
-# ── LBPH Face Recognition (matches example projects) ───────────────
+# ── Identity Gallery Training ──────────────────────────────────────
 
 def train_model():
     """
-    Train LBPH face recognizer from face_samples/ directory.
-    Each subdirectory = one person. All images inside become training samples.
-    Returns (model, names_dict) and caches globally.
+    Build identity galleries from stored criminal samples.
+    Returns (None, names_dict) to preserve legacy return shape.
     """
-    global _lbph_model, _lbph_names, _model_trained, _subject_embedding_gallery, _subject_reid_gallery
+    global _model_trained, _subject_embedding_gallery, _subject_reid_gallery, _trained_subject_names
 
-    model = cv2.face.LBPHFaceRecognizer_create()
-    images, labels, names = [], [], {}
-    current_id = 0
-
-    if not os.path.isdir(FACE_SAMPLES_DIR):
-        _model_trained = False
-        _subject_embedding_gallery = {}
-        _subject_reid_gallery = {}
-        return None, {}
-
-    for subdir in sorted(os.listdir(FACE_SAMPLES_DIR)):
-        subject_path = os.path.join(FACE_SAMPLES_DIR, subdir)
-        if not os.path.isdir(subject_path):
-            continue
-
-        names[current_id] = subdir
-        for filename in os.listdir(subject_path):
-            _, ext = os.path.splitext(filename)
-            if ext.lower() not in [".png", ".jpg", ".jpeg", ".pgm"]:
-                continue
-            filepath = os.path.join(subject_path, filename)
-            img = cv2.imread(filepath, cv2.IMREAD_GRAYSCALE)
-            if img is None:
-                continue
-            # Ensure consistent size + contrast normalization
-            img = cv2.resize(img, (FACE_WIDTH, FACE_HEIGHT))
-            img = _normalize_gray(img)
-            images.append(img)
-            labels.append(current_id)
-
-            # Lightweight augmentation for pose/illumination robustness.
-            flipped = cv2.flip(img, 1)
-            images.append(flipped)
-            labels.append(current_id)
-
-            for angle in (-12, 12):
-                M = cv2.getRotationMatrix2D((FACE_WIDTH / 2, FACE_HEIGHT / 2), angle, 1.0)
-                rotated = cv2.warpAffine(img, M, (FACE_WIDTH, FACE_HEIGHT), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
-                images.append(rotated)
-                labels.append(current_id)
-
-        current_id += 1
-
-    if len(images) == 0 or len(names) == 0:
-        _model_trained = False
-        _subject_embedding_gallery = {}
-        _subject_reid_gallery = {}
-        return None, {}
-
-    images = np.array(images)
-    labels = np.array(labels)
-    model.train(images, labels)
-
-    _lbph_model = model
-    _lbph_names = names
-    _model_trained = True
     _subject_embedding_gallery = _build_subject_embedding_gallery()
     _subject_reid_gallery = _build_subject_reid_gallery()
-    print(f"[FaceEngine] LBPH model trained with {len(images)} samples across {len(names)} subjects")
-    return model, names
+    subject_names = sorted(set(_subject_embedding_gallery.keys()) | set(_subject_reid_gallery.keys()))
+    _trained_subject_names = {idx: name for idx, name in enumerate(subject_names)}
+    _model_trained = len(subject_names) > 0
+
+    face_counts = {n: len(v) for n, v in _subject_embedding_gallery.items()}
+    reid_counts = {n: len(v) for n, v in _subject_reid_gallery.items()}
+    print(
+        f"[FaceEngine] Galleries ready: subjects={len(subject_names)} "
+        f"face_subjects={len(face_counts)} reid_subjects={len(reid_counts)} "
+        f"face_counts={face_counts} reid_counts={reid_counts}"
+    )
+    # The gallery just changed — clear track-id locks so old name->track
+    # bindings can't bleed into the new state.
+    reset_face_tracker()
+    return None, _trained_subject_names
 
 
 def get_trained_model():
-    """Get the currently trained model, training if necessary."""
-    global _lbph_model, _lbph_names, _model_trained
+    """Get current identity gallery status in a backward-compatible shape."""
+    global _model_trained, _trained_subject_names
     if not _model_trained:
         train_model()
-    return _lbph_model, _lbph_names
+    return None, _trained_subject_names
 
 
-def recognize_faces_in_frame(frame):
+def recognize_faces_in_frame(frame, camera_id: str = "default"):
     """
-    Detect and recognize faces in a BGR frame.
-    Returns:
-      - annotated_frame (with bounding boxes and name labels)
-      - recognized: list of dicts with name, confidence, bounding_box
-    """
-    model, names = get_trained_model()
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    # Apply CLAHE for low-light / dark environment enhancement
-    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
-    gray = clahe.apply(gray)
-    face_coords = detect_faces_in_frame(gray)
-    recognized = []
-    matched_face_boxes = []
+    Person-centric tracking: BoxMOT ByteTrack yields stable motion ids on body
+    boxes; ArcFace + OSNet ReID feed weighted identity votes into the same track.
 
-    if model is None or len(names) == 0:
-        # No model trained — just return face detections without recognition
-        for face_coord in face_coords:
-            (x, y, w, h) = [v * DETECTION_SCALE for v in face_coord]
-            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-            cv2.putText(frame, "Unknown", (x, y - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-            recognized.append({
-                "name": "Unknown",
-                "confidence": 0,
-                "bounding_box": {"x": int(x), "y": int(y), "w": int(w), "h": int(h)},
-                "is_match": False,
-            })
+    Annotates the body box (primary). An inner thin box marks a visible face.
+    """
+    _, _names = get_trained_model()
+    recognized: list = []
+    frame_no = _next_frame_no(camera_id)
+
+    arcface_faces = detect_arcface_faces(frame)
+    if not arcface_faces:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+        gray = clahe.apply(gray)
+        face_coords = detect_faces_in_frame(gray)
+        legacy_faces = []
+        for fc in face_coords:
+            (x, y, w, h) = [v * DETECTION_SCALE for v in fc]
+            if w < 40 or h < 40:
+                continue
+            face_bgr = frame[y:y + h, x:x + w]
+            entry = _compute_embedding_entry_from_face_crop(face_bgr)
+            if entry is None:
+                continue
+            legacy_faces.append({"bbox": (x, y, w, h), "embedding": IdentityEmbedding(
+                vector=_entry_vector(entry), model=_entry_model(entry)
+            )})
+        arcface_faces = legacy_faces
+
+    yolo_dets = detect_person_boxes_in_frame(frame, LIVE_PERSON_DETECTION_THRESHOLD)
+    person_detections, det_meta = _assemble_person_detections(frame, yolo_dets, arcface_faces)
+
+    if VERBOSE_RECOGNITION_LOGS:
+        print(
+            f"[FaceEngine] person_track yolo={len(yolo_dets)} dets_for_mot={len(person_detections)} "
+            f"faces={len(arcface_faces)}"
+        )
+
+    tracks_out = update_motion_tracks(camera_id, frame, person_detections)
+
+    identity_store = get_identity_store()
+    unlock_streak = int(os.environ.get("TRACKER_UNLOCK_DISAGREEMENT_STREAK", "5"))
+    seen_motion: set[int] = set()
+
+    if tracks_out is None or len(tracks_out) == 0:
+        identity_store.end_frame(camera_id, frame_no, seen_motion, IDENTITY_MAX_MISSED)
         return frame, recognized
 
-    for face_coord in face_coords:
-        (x, y, w, h) = [v * DETECTION_SCALE for v in face_coord]
-        if w < 40 or h < 40:
-            # Skip tiny crops that often produce noisy LBPH predictions.
-            continue
-        face = gray[y:y + h, x:x + w]
-        face_bgr = frame[y:y + h, x:x + w]
-
-        if face.size == 0:
+    for row in tracks_out:
+        tx1, ty1, tx2, ty2 = int(row[0]), int(row[1]), int(row[2]), int(row[3])
+        motion_id = int(row[4])
+        tx1, ty1 = max(0, tx1), max(0, ty1)
+        ty2 = min(frame.shape[0], ty2)
+        tx2 = min(frame.shape[1], tx2)
+        if tx2 <= tx1 or ty2 <= ty1:
             continue
 
-        face_resized = cv2.resize(face, (FACE_WIDTH, FACE_HEIGHT))
-        face_resized = _normalize_gray(face_resized)
+        seen_motion.add(motion_id)
+        dj = _match_detection_to_track_meta(tx1, ty1, tx2, ty2, person_detections)
+        m0 = det_meta[dj] if dj < len(det_meta) else {"face_idx": None, "from_yolo": True}
+        fi = m0.get("face_idx")
 
-        # Test-time augmentation + voting to improve non-frontal matching.
-        variants = [face_resized, cv2.flip(face_resized, 1)]
-        for angle in (-10, 10):
-            M = cv2.getRotationMatrix2D((FACE_WIDTH / 2, FACE_HEIGHT / 2), angle, 1.0)
-            variants.append(
-                cv2.warpAffine(
-                    face_resized,
-                    M,
-                    (FACE_WIDTH, FACE_HEIGHT),
-                    flags=cv2.INTER_LINEAR,
-                    borderMode=cv2.BORDER_REFLECT,
-                )
-            )
+        person_xywh = _xyxy_to_xywh(tx1, ty1, tx2, ty2)
+        crop_body = frame[ty1:ty2, tx1:tx2]
+        query_reid = _embedding_to_entry(compute_reid_embedding(crop_body), fallback_model="torchreid:osnet")
 
-        votes = {}
-        best_conf = {}
-        for v in variants:
-            pred_i, conf_i = model.predict(v)
-            votes[pred_i] = votes.get(pred_i, 0) + 1
-            if pred_i not in best_conf or conf_i < best_conf[pred_i]:
-                best_conf[pred_i] = conf_i
+        face_emb_vec = None
+        query_embedding = None
+        face_bbox = None
+        fx = fy = fw = fh = 0
+        if fi is not None and fi < len(arcface_faces):
+            face = arcface_faces[fi]
+            emb = face["embedding"]
+            face_emb_vec = np.asarray(emb.vector, dtype=np.float32)
+            query_embedding = {"model": emb.model, "vector": emb.vector}
+            fx, fy, fw, fh = face["bbox"]
+            face_bbox = (int(fx), int(fy), int(fw), int(fh))
 
-        prediction = max(votes.items(), key=lambda kv: (kv[1], -best_conf.get(kv[0], 1e9)))[0]
-        confidence = best_conf.get(prediction, 999.0)
+        emb_name, emb_conf, emb_ok = _face_vote_from_embedding(query_embedding)
+        body_name, body_conf, body_ok = _body_vote_from_embedding(query_reid)
 
-        # Cross-reference against all stored images per subject via modern face embeddings first.
-        emb_name = None
-        emb_conf = 0.0
-        emb_margin_ok = False
-        query_embedding = _compute_embedding_entry_from_face_crop(face_bgr)
-        if query_embedding is not None and _subject_embedding_gallery:
-            best_name, best_sim, second_best_sim = _best_gallery_match(query_embedding, _subject_embedding_gallery)
-            embedding_threshold, _ = _face_threshold_for_model(_entry_model(query_embedding))
-            if best_name is not None and best_sim >= embedding_threshold:
-                emb_name = best_name
-                emb_conf = float(best_sim)
-                emb_margin_ok = (best_sim - max(second_best_sim, 0.0)) >= EMBEDDING_TOP2_MARGIN
+        q_face = _face_quality_factor(int(fw), int(fh)) if face_bbox else 0.0
+        votes: list[VoteObservation] = []
 
-        # LBPH confidence is a distance metric: lower is better.
-        # Use a slightly higher threshold for live webcam variability.
-        lbph_name = names[prediction] if (confidence <= LBPH_MATCH_THRESHOLD and prediction in names) else None
-        lbph_score = max(0.0, min(1.0, (LBPH_MATCH_THRESHOLD - float(confidence)) / 30.0))
+        if emb_ok and emb_name:
+            votes.append(VoteObservation(
+                frame_no, "face", emb_name, emb_conf, weight=2.0 * max(0.35, q_face)
+            ))
+        if body_ok and body_name:
+            accept_body = True
+            if emb_name and emb_name != body_name and body_conf < REID_STRONG_MATCH_THRESHOLD + 0.04:
+                accept_body = False
+            if accept_body:
+                w_b = 1.0 if (not emb_name or emb_name == body_name) else 0.35
+                votes.append(VoteObservation(
+                    frame_no, "body", body_name, body_conf, weight=w_b
+                ))
 
-        # Conservative acceptance to reduce cross-person confusion:
-        # accept embedding match only if very strong OR if not ambiguous.
-        _, embedding_strong_threshold = _face_threshold_for_model(_entry_model(query_embedding))
-        emb_acceptable = emb_name is not None and (
-            emb_conf >= embedding_strong_threshold or emb_margin_ok
+        if not votes and query_reid is not None and _entry_vector(query_reid) is not None:
+            g = _global_reid_lookup(_entry_vector(query_reid))
+            if g:
+                gn, gs = g
+                votes.append(VoteObservation(
+                    frame_no, "global_reid", gn, float(gs), weight=0.75
+                ))
+
+        tr = identity_store.get_or_create(
+            camera_id,
+            motion_id,
+            LOCK_WEIGHT_THRESHOLD,
+            LOCK_MIN_AVG_CONF,
+            unlock_streak,
         )
+        prev_lock = tr.locked_name
+        tr.add_observation(
+            frame_no,
+            person_xywh,
+            _entry_vector(query_reid),
+            face_emb_vec,
+            face_bbox,
+            votes,
+        )
+        if tr.locked_name and tr.locked_name != prev_lock:
+            _push_global_reid(tr.locked_name, _entry_vector(query_reid))
 
-        if emb_acceptable and (lbph_name is None or emb_conf >= lbph_score):
-            name = emb_name
-            color = (0, 0, 255)
-            is_match = True
-            label = f"{name} ({int(emb_conf * 100)}%)"
-            out_conf = round(float(emb_conf), 4)
-        elif lbph_name:
-            name = lbph_name
-            color = (0, 0, 255)  # Red for recognized criminal
-            is_match = True
-            label = f"{name} ({confidence:.0f})"
-            out_conf = round(float(confidence), 2)
-        else:
-            name = "Unknown"
-            color = (0, 255, 0)  # Green for unknown
-            is_match = False
-            label = "Unknown"
-            out_conf = round(float(confidence), 2)
+        is_match = tr.locked_name is not None
+        name = tr.locked_name if is_match else "Unknown"
+        out_conf = round(float(tr.locked_confidence), 4) if is_match else 0.0
 
-        cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
-        cv2.putText(frame, label, (x, y - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-
-        serialized_query = _serialize_identity_embeddings(face_entries=[query_embedding]) if query_embedding is not None else []
+        tent_face = emb_name
+        tent_conf = float(emb_conf)
+        tent_body = body_name
+        body_tent_conf = float(body_conf)
+        if tent_face is None and tent_body and body_ok:
+            tent_face = tent_body
+            tent_conf = body_tent_conf
 
         if is_match:
-            recognized.append({
-                "name": name,
-                "confidence": out_conf,
-                "bounding_box": {"x": int(x), "y": int(y), "w": int(w), "h": int(h)},
-                "is_match": True,
-                "method": "face_embedding" if emb_acceptable and name == emb_name else "lbph",
-                "identity_backend": _entry_model(query_embedding) if emb_acceptable and name == emb_name else "opencv_lbph",
-                "identity_embeddings": serialized_query,
-            })
-            matched_face_boxes.append((int(x), int(y), int(w), int(h)))
-        elif not is_match:
-            recognized.append({
-                "name": "Unknown",
-                "confidence": out_conf,
-                "bounding_box": {"x": int(x), "y": int(y), "w": int(w), "h": int(h)},
-                "is_match": False,
-                "method": "unknown",
-                "identity_embeddings": serialized_query,
-            })
+            color = (0, 0, 255)
+            label = f"#{motion_id} {name} {int(tr.locked_confidence * 100)}%"
+            method = "person_track"
+            _log_recognition_decision(
+                method="person_track",
+                name=str(name),
+                confidence=out_conf,
+                details=f"motion_id={motion_id} age={tr.age} face_frames={tr.face_vote_frames}",
+            )
+        elif tent_face and (emb_ok or body_ok):
+            color = (0, 215, 255)
+            label = f"#{motion_id} ?{tent_face}? {int(tent_conf * 100)}%"
+            method = "person_track_pending"
+            _log_recognition_decision(
+                method="person_track_pending",
+                name=str(tent_face),
+                confidence=round(float(tent_conf), 4),
+                details=f"motion_id={motion_id} age={tr.age}",
+            )
+        else:
+            color = (0, 255, 0)
+            label = f"#{motion_id} Unknown"
+            method = "unknown"
+            _log_recognition_decision(
+                method="unknown",
+                name="Unknown",
+                confidence=0.0,
+                details=f"motion_id={motion_id} age={tr.age}",
+            )
 
-    for det in detect_person_boxes_in_frame(frame, LIVE_PERSON_DETECTION_THRESHOLD):
-        box = det.get("bounding_box") or {}
-        x, y, w, h = int(box.get("x", 0)), int(box.get("y", 0)), int(box.get("w", 0)), int(box.get("h", 0))
-        if w <= 0 or h <= 0:
-            continue
-        if any(_iou((x, y, w, h), face_box) > 0.15 for face_box in matched_face_boxes):
-            continue
+        cv2.rectangle(frame, (tx1, ty1), (tx2, ty2), color, 2)
+        cv2.putText(
+            frame, label, (tx1, max(24, ty1 - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2,
+        )
+        if face_bbox and fw >= 20 and fh >= 20:
+            fx1, fy1 = int(fx), int(fy)
+            cv2.rectangle(
+                frame, (fx1, fy1), (fx1 + int(fw), fy1 + int(fh)),
+                (200, 200, 200), 1,
+            )
 
-        crop = frame[y:y + h, x:x + w]
-        query_reid = _embedding_to_entry(compute_reid_embedding(crop), fallback_model="torchreid:osnet")
-        if query_reid is None:
-            continue
-
-        best_name, best_sim, second_best_sim = _best_gallery_match(query_reid, _subject_reid_gallery)
-        margin_ok = (best_sim - max(second_best_sim, 0.0)) >= EMBEDDING_TOP2_MARGIN
-        is_reid_match = (
-            best_name is not None and
-            best_sim >= REID_MATCH_THRESHOLD and
-            (best_sim >= REID_STRONG_MATCH_THRESHOLD or margin_ok)
+        serialized = _serialize_identity_embeddings(
+            face_entries=[query_embedding] if query_embedding else [],
+            reid_entries=[query_reid] if query_reid is not None else [],
         )
 
-        if is_reid_match:
-            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 0, 255), 2)
-            cv2.putText(frame, f"{best_name} ReID ({int(best_sim * 100)}%)", (x, max(20, y - 10)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+        alert_eligible = bool(
+            is_match
+            and tr.age >= ALERT_MIN_TRACK_AGE
+            and tr.locked_confidence >= ALERT_MIN_LOCKED_CONF
+            and tr.face_vote_frames >= ALERT_MIN_FACE_FRAMES
+        )
 
         recognized.append({
-            "name": best_name if is_reid_match else "Unknown",
-            "confidence": round(float(best_sim if is_reid_match else 0), 4),
-            "bounding_box": {"x": int(x), "y": int(y), "w": int(w), "h": int(h)},
-            "is_match": bool(is_reid_match),
-            "method": "person_reid" if is_reid_match else "unknown",
-            "identity_backend": _entry_model(query_reid),
-            "identity_embeddings": _serialize_identity_embeddings(reid_entries=[query_reid]),
+            "name": name,
+            "confidence": out_conf,
+            "bounding_box": {"x": person_xywh[0], "y": person_xywh[1], "w": person_xywh[2], "h": person_xywh[3]},
+            "face_bounding_box": {
+                "x": face_bbox[0], "y": face_bbox[1], "w": face_bbox[2], "h": face_bbox[3],
+            } if face_bbox else None,
+            "is_match": is_match,
+            "alert_eligible": alert_eligible,
+            "method": method,
+            "motion_track_id": motion_id,
+            "track_id": motion_id,
+            "track_age": tr.age,
+            "face_vote_frames": tr.face_vote_frames,
+            "tentative_name": tent_face,
+            "tentative_confidence": round(float(tent_conf), 4),
+            "vote_sources": {
+                "face": {"name": emb_name, "score": round(float(emb_conf), 4), "accepted": emb_ok},
+                "body": {"name": body_name, "score": round(float(body_conf), 4), "accepted": body_ok},
+            },
+            "reid_best_match_name": body_name,
+            "reid_best_match_score": round(float(body_conf), 4),
+            "reid_threshold": REID_MATCH_THRESHOLD,
+            "identity_backend": _entry_model(query_embedding) if query_embedding else (
+                _entry_model(query_reid) if query_reid else None
+            ),
+            "identity_embeddings": serialized,
         })
 
+    identity_store.end_frame(camera_id, frame_no, seen_motion, IDENTITY_MAX_MISSED)
     return frame, recognized
 
 
@@ -511,12 +707,15 @@ def _safe_subject_name(name: str) -> str:
     return safe.replace(" ", "_") or "unknown_subject"
 
 
+MIN_CRIMINAL_FACE_SAMPLES = int(os.environ.get("MIN_CRIMINAL_FACE_SAMPLES", "5"))
+
+
 def register_criminal_samples(name: str, images_data: list, fir_number: str = "", append: bool = False):
     """
     Register a criminal by saving multiple face sample images.
     images_data: list of numpy arrays (BGR images from webcam).
     Creates face_samples/{name}/ with preprocessed face images.
-    Returns dict with registration info, or None on failure.
+    Returns dict with registration info, error dict, or None on failure.
     """
     safe_name = _safe_subject_name(name)
     person_dir = os.path.join(FACE_SAMPLES_DIR, safe_name)
@@ -563,6 +762,21 @@ def register_criminal_samples(name: str, images_data: list, fir_number: str = ""
     if saved_count < 1:
         shutil.rmtree(temp_dir, ignore_errors=True)
         return None
+
+    if not append and saved_count < MIN_CRIMINAL_FACE_SAMPLES:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        if os.path.isdir(originals_dir):
+            shutil.rmtree(originals_dir, ignore_errors=True)
+        return {
+            "error": (
+                f"Enrollment requires at least {MIN_CRIMINAL_FACE_SAMPLES} images with detectable faces. "
+                f"Got {saved_count}."
+            ),
+            "code": "INSUFFICIENT_SAMPLES",
+            "failed_captures": failed,
+            "sample_count": saved_count,
+            "min_required": MIN_CRIMINAL_FACE_SAMPLES,
+        }
 
     # Move temp to final (overwrite or append).
     if append and os.path.isdir(person_dir):
@@ -907,14 +1121,14 @@ def add_criminal(name: str, fir_number: str, mugshot_path: str) -> dict | None:
     """
     Add a criminal to the face database (single mugshot path).
     Computes face embedding from the mugshot and stores it.
-    Also creates face_samples entry for LBPH training.
+    Also stores normalized samples for backward-compatible sample management.
     """
     img = cv2.imread(mugshot_path)
     embedding = compute_face_embedding_entry(mugshot_path)
     if embedding is None or img is None:
         return None
 
-    # Also create face_samples entry for LBPH
+    # Also create normalized face_samples entry for sample lifecycle compatibility
     safe_name = _safe_subject_name(name)
     person_dir = os.path.join(FACE_SAMPLES_DIR, safe_name)
     originals_dir = os.path.join(CRIMINAL_DB_DIR, "original_samples", safe_name)
@@ -938,7 +1152,7 @@ def add_criminal(name: str, fir_number: str, mugshot_path: str) -> dict | None:
 
     criminal_id = _upsert_criminal_identity_record(name, fir_number, originals_dir, mugshot_path)
 
-    # Re-train LBPH with new data
+    # Refresh identity galleries with new data
     train_model()
 
     return {
