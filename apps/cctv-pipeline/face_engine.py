@@ -442,6 +442,8 @@ def recognize_faces_in_frame(frame):
         cv2.putText(frame, label, (x, y - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
+        serialized_query = _serialize_identity_embeddings(face_entries=[query_embedding]) if query_embedding is not None else []
+
         if is_match:
             recognized.append({
                 "name": name,
@@ -450,6 +452,7 @@ def recognize_faces_in_frame(frame):
                 "is_match": True,
                 "method": "face_embedding" if emb_acceptable and name == emb_name else "lbph",
                 "identity_backend": _entry_model(query_embedding) if emb_acceptable and name == emb_name else "opencv_lbph",
+                "identity_embeddings": serialized_query,
             })
             matched_face_boxes.append((int(x), int(y), int(w), int(h)))
         elif not is_match:
@@ -459,37 +462,44 @@ def recognize_faces_in_frame(frame):
                 "bounding_box": {"x": int(x), "y": int(y), "w": int(w), "h": int(h)},
                 "is_match": False,
                 "method": "unknown",
+                "identity_embeddings": serialized_query,
             })
 
-    if _subject_reid_gallery:
-        for det in detect_person_boxes_in_frame(frame, LIVE_PERSON_DETECTION_THRESHOLD):
-            box = det.get("bounding_box") or {}
-            x, y, w, h = int(box.get("x", 0)), int(box.get("y", 0)), int(box.get("w", 0)), int(box.get("h", 0))
-            if w <= 0 or h <= 0:
-                continue
-            if any(_iou((x, y, w, h), face_box) > 0.15 for face_box in matched_face_boxes):
-                continue
+    for det in detect_person_boxes_in_frame(frame, LIVE_PERSON_DETECTION_THRESHOLD):
+        box = det.get("bounding_box") or {}
+        x, y, w, h = int(box.get("x", 0)), int(box.get("y", 0)), int(box.get("w", 0)), int(box.get("h", 0))
+        if w <= 0 or h <= 0:
+            continue
+        if any(_iou((x, y, w, h), face_box) > 0.15 for face_box in matched_face_boxes):
+            continue
 
-            crop = frame[y:y + h, x:x + w]
-            query_reid = _embedding_to_entry(compute_reid_embedding(crop), fallback_model="torchreid:osnet")
-            best_name, best_sim, second_best_sim = _best_gallery_match(query_reid, _subject_reid_gallery)
-            margin_ok = (best_sim - max(second_best_sim, 0.0)) >= EMBEDDING_TOP2_MARGIN
-            if best_name is None or best_sim < REID_MATCH_THRESHOLD:
-                continue
-            if best_sim < REID_STRONG_MATCH_THRESHOLD and not margin_ok:
-                continue
+        crop = frame[y:y + h, x:x + w]
+        query_reid = _embedding_to_entry(compute_reid_embedding(crop), fallback_model="torchreid:osnet")
+        if query_reid is None:
+            continue
 
+        best_name, best_sim, second_best_sim = _best_gallery_match(query_reid, _subject_reid_gallery)
+        margin_ok = (best_sim - max(second_best_sim, 0.0)) >= EMBEDDING_TOP2_MARGIN
+        is_reid_match = (
+            best_name is not None and
+            best_sim >= REID_MATCH_THRESHOLD and
+            (best_sim >= REID_STRONG_MATCH_THRESHOLD or margin_ok)
+        )
+
+        if is_reid_match:
             cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 0, 255), 2)
             cv2.putText(frame, f"{best_name} ReID ({int(best_sim * 100)}%)", (x, max(20, y - 10)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-            recognized.append({
-                "name": best_name,
-                "confidence": round(float(best_sim), 4),
-                "bounding_box": {"x": int(x), "y": int(y), "w": int(w), "h": int(h)},
-                "is_match": True,
-                "method": "person_reid",
-                "identity_backend": _entry_model(query_reid),
-            })
+
+        recognized.append({
+            "name": best_name if is_reid_match else "Unknown",
+            "confidence": round(float(best_sim if is_reid_match else 0), 4),
+            "bounding_box": {"x": int(x), "y": int(y), "w": int(w), "h": int(h)},
+            "is_match": bool(is_reid_match),
+            "method": "person_reid" if is_reid_match else "unknown",
+            "identity_backend": _entry_model(query_reid),
+            "identity_embeddings": _serialize_identity_embeddings(reid_entries=[query_reid]),
+        })
 
     return frame, recognized
 
@@ -589,6 +599,7 @@ def register_criminal_samples(name: str, images_data: list, fir_number: str = ""
         "profile_image": profile_name,
         "append_mode": append,
         "embedding_id": identity_id,
+        "identity_embeddings": collect_subject_identity_embeddings(originals_dir),
         "identity_backends": get_identity_backend_status(),
     }
 
@@ -769,6 +780,23 @@ def _serialize_entries(entries):
     return serialized
 
 
+def _serialize_identity_embeddings(face_entries=None, reid_entries=None, sample_path: str | None = None):
+    payload = []
+    for modality, entries in (("FACE", face_entries or []), ("REID", reid_entries or [])):
+        for entry in entries:
+            vector = _entry_vector(entry)
+            if vector is None:
+                continue
+            payload.append({
+                "modality": modality,
+                "model_name": _entry_model(entry),
+                "dimension": int(vector.shape[0]),
+                "vector": vector.astype(float).tolist(),
+                "sample_path": sample_path,
+            })
+    return payload
+
+
 def _deserialize_entries(raw_embeddings, fallback_model: str):
     entries = []
     if not isinstance(raw_embeddings, list):
@@ -834,6 +862,47 @@ def _upsert_criminal_identity_record(name: str, fir_number: str, originals_dir: 
     return identity_id
 
 
+def collect_subject_identity_embeddings(originals_dir: str):
+    """Return face and ReID embeddings for every original sample image in a subject directory."""
+    face_entries = []
+    reid_entries = []
+
+    if os.path.isdir(originals_dir):
+        for fname in sorted(os.listdir(originals_dir)):
+            if not fname.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
+                continue
+            path = os.path.join(originals_dir, fname)
+            face_entry = compute_face_embedding_entry(path)
+            if face_entry is not None:
+                face_entries.append((face_entry, path))
+            img = cv2.imread(path)
+            reid_entry = _embedding_to_entry(compute_reid_embedding(img), fallback_model="torchreid:osnet")
+            if reid_entry is not None:
+                reid_entries.append((reid_entry, path))
+
+    payload = []
+    for entry, path in face_entries:
+        payload.extend(_serialize_identity_embeddings(face_entries=[entry], sample_path=path))
+    for entry, path in reid_entries:
+        payload.extend(_serialize_identity_embeddings(reid_entries=[entry], sample_path=path))
+    return payload
+
+
+def extract_identity_embeddings_from_image(image_path: str) -> list:
+    """Compute query embeddings for a probe image without matching locally."""
+    img = cv2.imread(image_path)
+    if img is None:
+        return []
+
+    face_entry = compute_face_embedding_entry(image_path)
+    reid_entry = _embedding_to_entry(compute_reid_embedding(img), fallback_model="torchreid:osnet")
+    return _serialize_identity_embeddings(
+        face_entries=[face_entry] if face_entry is not None else [],
+        reid_entries=[reid_entry] if reid_entry is not None else [],
+        sample_path=image_path,
+    )
+
+
 def add_criminal(name: str, fir_number: str, mugshot_path: str) -> dict | None:
     """
     Add a criminal to the face database (single mugshot path).
@@ -872,7 +941,13 @@ def add_criminal(name: str, fir_number: str, mugshot_path: str) -> dict | None:
     # Re-train LBPH with new data
     train_model()
 
-    return {"id": criminal_id, "name": name, "fir_number": fir_number, "identity_backends": get_identity_backend_status()}
+    return {
+        "id": criminal_id,
+        "name": name,
+        "fir_number": fir_number,
+        "identity_embeddings": collect_subject_identity_embeddings(originals_dir),
+        "identity_backends": get_identity_backend_status(),
+    }
 
 
 def list_criminals() -> list:

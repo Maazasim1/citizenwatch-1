@@ -12,7 +12,7 @@ generator client {
 datasource db {
   provider   = "postgresql"
   url        = env("DATABASE_URL")
-  extensions = [postgis]
+  extensions = [postgis, vector]
 }
 
 model User {
@@ -351,7 +351,7 @@ model CriminalRecord {
   name        String
   firNumber   String?
   mugshotUrl  String   // URL to stored mugshot
-  embeddingId String?  // reference key to numpy embedding store on Python side
+  embeddingId String?  // legacy Python identity id; pgvector IdentityEmbedding is authoritative
   notes       String?
   sampleCount Int      @default(0) // number of LBPH training samples
   addedById   String?  // law enforcement user who added
@@ -359,6 +359,29 @@ model CriminalRecord {
   updatedAt   DateTime @updatedAt
 
   faceMatches FaceMatch[]
+  identityEmbeddings IdentityEmbedding[]
+}
+
+model IdentityEmbedding {
+  id          String @id @default(uuid())
+  criminalId String
+  criminal   CriminalRecord @relation(fields: [criminalId], references: [id], onDelete: Cascade)
+
+  modality   EmbeddingModality
+  modelName  String
+  dimension  Int
+  vector     Unsupported("vector")
+  samplePath String?
+
+  createdAt DateTime @default(now())
+
+  @@index([criminalId])
+  @@index([modality, modelName, dimension])
+}
+
+enum EmbeddingModality {
+  FACE
+  REID
 }
 
 model FaceMatch {

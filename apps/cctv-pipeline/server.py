@@ -28,6 +28,7 @@ from face_engine import (
     remove_criminal_by_name,
     sync_subjects_with_names,
     register_criminal_samples,
+    extract_identity_embeddings_from_image,
     recognize_faces_in_frame,
     train_model,
     get_recognition_status,
@@ -219,6 +220,29 @@ def match_face_endpoint():
         "filename": file.filename,
         "matches": matches,
         "match_count": len(matches),
+    })
+
+
+@app.route("/extract-identity", methods=["POST"])
+def extract_identity_endpoint():
+    """
+    Upload an image and return probe face/ReID embeddings for pgvector search.
+    Matching is intentionally left to the Node/Postgres layer.
+    """
+    if "file" not in request.files:
+        return jsonify({"error": "No file uploaded"}), 400
+
+    file = request.files["file"]
+    ext = os.path.splitext(file.filename or "")[1].lower()
+    unique_name = f"{uuid.uuid4()}{ext}"
+    saved_path = os.path.join(UPLOAD_DIR, unique_name)
+    file.save(saved_path)
+
+    embeddings = extract_identity_embeddings_from_image(saved_path)
+    return jsonify({
+        "filename": file.filename,
+        "identity_embeddings": embeddings,
+        "embedding_count": len(embeddings),
     })
 
 

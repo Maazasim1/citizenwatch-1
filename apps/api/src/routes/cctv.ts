@@ -5,6 +5,13 @@ import multer from 'multer';
 import fs from 'fs';
 import path from 'path';
 import { Readable } from 'stream';
+import {
+    IdentityEmbeddingPayload,
+    matchIdentityEmbeddings,
+    removeIdentityEmbeddings,
+    storeIdentityEmbeddings,
+    stripIdentityEmbeddings,
+} from '../services/identityEmbeddings';
 
 const router = Router();
 
@@ -32,6 +39,21 @@ const normalizeSubjectName = (name: string): string =>
         .toLowerCase()
         .replace(/[^a-z0-9 _-]/g, '')
         .replace(/\s+/g, '_');
+
+const queryIdentityEmbeddingsForFile = async (filePath: string): Promise<IdentityEmbeddingPayload[]> => {
+    const result = await forwardFileToPipeline(filePath, '/extract-identity');
+    return Array.isArray((result as any)?.identity_embeddings)
+        ? (result as any).identity_embeddings
+        : [];
+};
+
+const matchFileWithPgvector = async (
+    filePath: string,
+    threshold = 0.65,
+) => {
+    const embeddings = await queryIdentityEmbeddingsForFile(filePath);
+    return matchIdentityEmbeddings(embeddings, { faceThreshold: threshold });
+};
 
 const syncPipelineSubjectsWithDb = async () => {
     const current = await prisma.criminalRecord.findMany({
@@ -203,49 +225,32 @@ router.post('/upload', authenticate, requireRole('MODERATOR', 'LAW_ENFORCEMENT',
             try {
                 const cropPath = path.join(process.cwd(), '..', 'cctv-pipeline', 'detections', det.crop_filename);
                 if (fs.existsSync(cropPath)) {
-                    const FormDataMatch = await import('form-data');
-                    const FormDataMatchCls = FormDataMatch.default;
-                    const matchFormData = new FormDataMatchCls();
-                    matchFormData.append('file', fs.createReadStream(cropPath));
-                    matchFormData.append('threshold', '0.65');
+                    const matches = await matchFileWithPgvector(cropPath, 0.65);
+                    for (const m of matches) {
+                        const faceMatch = await prisma.faceMatch.create({
+                            data: {
+                                criminalId: m.criminalId,
+                                detectionId: record.id,
+                                detectionSource: 'CCTV',
+                                confidence: m.confidence,
+                                latitude,
+                                longitude,
+                            },
+                        });
 
-                    const matchResp = await fetch(`${CCTV_PIPELINE_URL}/match-face`, {
-                        method: 'POST',
-                        body: matchFormData as any,
-                        headers: matchFormData.getHeaders?.() ?? {},
-                    });
-
-                    if (matchResp.ok) {
-                        const matchResult = await matchResp.json() as any;
-                        for (const m of matchResult.matches || []) {
-                            const criminal = await prisma.criminalRecord.findFirst({
-                                where: { embeddingId: m.criminal_id },
+                        if (io) {
+                            io.emit('criminal:matched', {
+                                matchId: faceMatch.id,
+                                criminalName: m.name,
+                                firNumber: m.firNumber,
+                                confidence: m.confidence,
+                                latitude,
+                                longitude,
+                                source: 'CCTV',
+                                mugshotUrl: m.mugshotUrl,
+                                method: m.method,
+                                identityBackend: m.identity_backend,
                             });
-                            if (!criminal) continue;
-
-                            const faceMatch = await prisma.faceMatch.create({
-                                data: {
-                                    criminalId: criminal.id,
-                                    detectionId: record.id,
-                                    detectionSource: 'CCTV',
-                                    confidence: m.confidence,
-                                    latitude,
-                                    longitude,
-                                },
-                            });
-
-                            if (io) {
-                                io.emit('criminal:matched', {
-                                    matchId: faceMatch.id,
-                                    criminalName: criminal.name,
-                                    firNumber: criminal.firNumber,
-                                    confidence: m.confidence,
-                                    latitude,
-                                    longitude,
-                                    source: 'CCTV',
-                                    mugshotUrl: criminal.mugshotUrl
-                                });
-                            }
                         }
                     }
                 }
@@ -332,6 +337,7 @@ router.post('/criminal-db', authenticate, requireRole('LAW_ENFORCEMENT', 'ADMIN'
                 addedById: (req as any).user?.userId || null,
             },
         });
+        await storeIdentityEmbeddings(record.id, pipelineResult.criminal?.identity_embeddings, { replace: true });
 
         res.status(201).json({ criminal: record });
     } catch (error) {
@@ -453,6 +459,7 @@ router.delete('/criminal-db/:id', authenticate, requireRole('LAW_ENFORCEMENT', '
 
         // Also delete face matches to maintain integrity if onDelete Cascade isn't set
         await prisma.faceMatch.deleteMany({ where: { criminalId: id } });
+        await removeIdentityEmbeddings(id);
         await prisma.criminalRecord.delete({ where: { id } });
         await syncPipelineSubjectsWithDb();
         res.json({ success: true });
@@ -545,27 +552,19 @@ router.post('/detections/:id/match', authenticate, requireRole('MODERATOR', 'LAW
             return res.status(404).json({ error: 'Detection crop file not found' });
         }
 
-        let matchResult: any;
+        let matches: Awaited<ReturnType<typeof matchFileWithPgvector>>;
         try {
-            matchResult = await forwardFileToPipeline(cropPath, '/match-face', {
-                threshold: req.body.threshold || '0.65',
-            });
+            matches = await matchFileWithPgvector(cropPath, Number(req.body.threshold || '0.65'));
         } catch (err: any) {
             return res.status(502).json({ error: 'Pipeline unavailable', details: err?.message });
         }
 
         // Store matches in DB
         const stored = [];
-        for (const m of matchResult.matches || []) {
-            // Find the criminal record by embeddingId
-            const criminal = await prisma.criminalRecord.findFirst({
-                where: { embeddingId: m.criminal_id },
-            });
-            if (!criminal) continue;
-
+        for (const m of matches) {
             const faceMatch = await prisma.faceMatch.create({
                 data: {
-                    criminalId: criminal.id,
+                    criminalId: m.criminalId,
                     detectionId: detection.id,
                     detectionSource: 'CCTV',
                     confidence: m.confidence,
@@ -615,22 +614,20 @@ router.post('/suspect-reviews/:id/submit-for-matching', authenticate, requireRol
             return res.status(404).json({ error: 'Isolated photo file not found' });
         }
 
-        let matchResult: any;
+        let matches: Awaited<ReturnType<typeof matchFileWithPgvector>>;
         try {
-            matchResult = await forwardFileToPipeline(review.isolatedPath, '/match-face', {
-                threshold: '0.65',
-            });
+            matches = await matchFileWithPgvector(review.isolatedPath, 0.65);
         } catch (err: any) {
             return res.status(502).json({ error: 'Pipeline unavailable', details: err?.message });
         }
 
-        const hasMatches = (matchResult.matches || []).length > 0;
+        const hasMatches = matches.length > 0;
 
         const updated = await prisma.suspectPhotoReview.update({
             where: { id },
             data: {
                 status: hasMatches ? 'MATCHED' : 'NO_MATCH',
-                matchResults: JSON.stringify(matchResult.matches || []),
+                matchResults: JSON.stringify(matches),
                 reviewedById: (req as any).user?.userId,
                 reviewedAt: new Date(),
             },
@@ -638,15 +635,10 @@ router.post('/suspect-reviews/:id/submit-for-matching', authenticate, requireRol
 
         // If matches found, create FaceMatch records
         if (hasMatches) {
-            for (const m of matchResult.matches) {
-                const criminal = await prisma.criminalRecord.findFirst({
-                    where: { embeddingId: m.criminal_id },
-                });
-                if (!criminal) continue;
-
+            for (const m of matches) {
                 await prisma.faceMatch.create({
                     data: {
-                        criminalId: criminal.id,
+                        criminalId: m.criminalId,
                         detectionSource: 'CITIZEN_PHOTO',
                         confidence: m.confidence,
                     },
@@ -654,7 +646,7 @@ router.post('/suspect-reviews/:id/submit-for-matching', authenticate, requireRol
             }
         }
 
-        res.json({ review: updated, matches: matchResult.matches || [] });
+        res.json({ review: updated, matches });
     } catch (error) {
         console.error(error);
         res.status(500).json({ error: 'Failed to submit for matching' });
@@ -805,6 +797,7 @@ router.post('/register-criminal-samples', authenticate, requireRole('LAW_ENFORCE
                 },
             });
         }
+        await storeIdentityEmbeddings(record.id, registration?.identity_embeddings, { replace: true });
 
         res.status(201).json({ criminal: record, registration });
     } catch (error) {
@@ -848,6 +841,7 @@ router.post('/criminal-db/:id/add-samples', authenticate, requireRole('LAW_ENFOR
                 embeddingId: (data as any)?.registration?.embedding_id || criminal.embeddingId,
             },
         });
+        await storeIdentityEmbeddings(updated.id, (data as any)?.registration?.identity_embeddings, { replace: true });
         res.json({ criminal: updated, registration: (data as any)?.registration ?? null });
     } catch (error) {
         console.error(error);
@@ -886,23 +880,54 @@ router.post('/recognize-frame', authenticate, requireRole('MODERATOR', 'LAW_ENFO
             select: { id: true, name: true, firNumber: true, mugshotUrl: true },
         });
         const criminalsByNorm = new Map<string, (typeof activeCriminals)[number]>();
+        const criminalsById = new Map<string, (typeof activeCriminals)[number]>();
         for (const c of activeCriminals) {
             criminalsByNorm.set(normalizeSubjectName(c.name), c);
+            criminalsById.set(c.id, c);
         }
 
+        const normalizedFaces = [];
+        for (const f of Array.isArray((pipelineResult as any)?.faces) ? (pipelineResult as any).faces : []) {
+            const cleanFace = stripIdentityEmbeddings(f as any);
+            const vectorMatches = await matchIdentityEmbeddings((f as any)?.identity_embeddings, { faceThreshold: 0.65 });
+            const best = vectorMatches[0];
+            if (best) {
+                normalizedFaces.push({
+                    ...cleanFace,
+                    name: best.name,
+                    confidence: best.confidence,
+                    is_match: true,
+                    method: best.method,
+                    identity_backend: best.identity_backend,
+                    criminalId: best.criminalId,
+                });
+            } else {
+                normalizedFaces.push({
+                    ...cleanFace,
+                    name: 'Unknown',
+                    confidence: normalizeLiveConfidence(cleanFace?.confidence),
+                    is_match: false,
+                });
+            }
+        }
+        const normalizedMatches = normalizedFaces.filter((f: any) => f?.is_match);
+
         // If matches found, create FaceMatch records and emit WebSocket alerts
-        const matchResults = (pipelineResult as any)?.matches || [];
+        const matchResults = normalizedMatches.length > 0 ? normalizedMatches : ((pipelineResult as any)?.matches || []);
         if (matchResults.length > 0) {
             const { io } = await import('../index');
 
             for (const m of matchResults) {
                 // Find criminal using normalized subject names (space/underscore safe).
-                const criminal = criminalsByNorm.get(normalizeSubjectName(String(m?.name ?? '')));
+                const criminal = criminalsById.get(String(m?.criminalId ?? '')) ||
+                    criminalsByNorm.get(normalizeSubjectName(String(m?.name ?? '')));
                 if (!criminal) continue;
 
                 // Convert LBPH distance (lower is better) to a 0..1 score for UI/notifications.
                 // Distances near threshold should be low confidence, very low distances high confidence.
-                const normalizedConfidence = normalizeLiveConfidence(m.confidence);
+                const normalizedConfidence = Number(m.confidence) >= 0 && Number(m.confidence) <= 1
+                    ? Number(m.confidence)
+                    : normalizeLiveConfidence(m.confidence);
                 // Dedup check: skip repeated alerts for same criminal at same location in the time window.
                 const recentMatches = await prisma.faceMatch.findMany({
                     where: {
@@ -947,6 +972,8 @@ router.post('/recognize-frame', authenticate, requireRole('MODERATOR', 'LAW_ENFO
                         spottedAt: faceMatch.spottedAt,
                         latitude: hasValidLocation ? cameraLat : null,
                         longitude: hasValidLocation ? cameraLng : null,
+                        method: m.method,
+                        identityBackend: m.identity_backend,
                     });
                 }
 
@@ -974,39 +1001,15 @@ router.post('/recognize-frame', authenticate, requireRole('MODERATOR', 'LAW_ENFO
             }
         }
 
-        // Guardrail: only allow identities that still exist in Criminal DB.
-        // This prevents stale pipeline subjects (e.g., deleted records not yet purged) from appearing in UI.
-        const activeNamesNorm = new Set(activeCriminals.map((c) => normalizeSubjectName(c.name)));
-
-        const normalizedFaces = Array.isArray((pipelineResult as any)?.faces)
-            ? (pipelineResult as any).faces.map((f: any) => {
-                  const normalized = {
-                      ...f,
-                      confidence: normalizeLiveConfidence(f?.confidence),
-                  };
-                  if (normalized?.is_match && !activeNamesNorm.has(normalizeSubjectName(String(normalized?.name ?? '')))) {
-                      return {
-                          ...normalized,
-                          name: 'Unknown',
-                          is_match: false,
-                      };
-                  }
-                  return normalized;
-              })
-            : [];
-        const normalizedMatches = Array.isArray((pipelineResult as any)?.matches)
-            ? (pipelineResult as any).matches
-                  .map((m: any) => ({
-                      ...m,
-                      confidence: normalizeLiveConfidence(m?.confidence),
-                  }))
-                  .filter((m: any) => activeNamesNorm.has(normalizeSubjectName(String(m?.name ?? ''))))
-            : [];
-
         res.json({
             ...(pipelineResult as any),
             faces: normalizedFaces,
-            matches: normalizedMatches,
+            matches: normalizedMatches.length > 0
+                ? normalizedMatches
+                : (((pipelineResult as any)?.matches || []).map((m: any) => stripIdentityEmbeddings({
+                    ...m,
+                    confidence: normalizeLiveConfidence(m?.confidence),
+                }))),
         });
     } catch (error) {
         console.error(error);
