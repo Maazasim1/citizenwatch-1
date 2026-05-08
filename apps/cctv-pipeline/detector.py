@@ -25,6 +25,44 @@ def get_model():
     return _model
 
 
+def detect_person_boxes_in_frame(frame, confidence_threshold: float = 0.4):
+    """
+    Run YOLOv8 person detection on an in-memory frame.
+    Returns person boxes without writing crops to disk.
+    """
+    if frame is None or getattr(frame, "size", 0) == 0:
+        return []
+
+    model = get_model()
+    results = model(frame, verbose=False)
+    detections = []
+
+    for result in results:
+        boxes = result.boxes
+        if boxes is None:
+            continue
+
+        for box in boxes:
+            cls_id = int(box.cls[0])
+            conf = float(box.conf[0])
+            if cls_id != 0 or conf < confidence_threshold:
+                continue
+
+            x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+            h, w = frame.shape[:2]
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(w, x2), min(h, y2)
+            if x2 <= x1 or y2 <= y1:
+                continue
+
+            detections.append({
+                "confidence": round(conf, 4),
+                "bounding_box": {"x": x1, "y": y1, "w": x2 - x1, "h": y2 - y1},
+            })
+
+    return detections
+
+
 def detect_persons_in_image(image_path: str, confidence_threshold: float = 0.4):
     """
     Run YOLOv8 person detection on a single image.

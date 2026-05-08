@@ -788,6 +788,7 @@ router.post('/register-criminal-samples', authenticate, requireRole('LAW_ENFORCE
                 where: { id: record.id },
                 data: {
                     sampleCount: Number(registration?.sample_count ?? record.sampleCount),
+                    embeddingId: registration?.embedding_id || record.embeddingId,
                     notes: notes || record.notes,
                 },
             });
@@ -799,6 +800,7 @@ router.post('/register-criminal-samples', authenticate, requireRole('LAW_ENFORCE
                     mugshotUrl,
                     notes: notes || null,
                     sampleCount: registration?.sample_count || 0,
+                    embeddingId: registration?.embedding_id || null,
                     addedById: (req as any).user?.userId || null,
                 },
             });
@@ -841,7 +843,10 @@ router.post('/criminal-db/:id/add-samples', authenticate, requireRole('LAW_ENFOR
         const sampleCount = Number((data as any)?.registration?.sample_count ?? criminal.sampleCount);
         const updated = await prisma.criminalRecord.update({
             where: { id: criminal.id },
-            data: { sampleCount },
+            data: {
+                sampleCount,
+                embeddingId: (data as any)?.registration?.embedding_id || criminal.embeddingId,
+            },
         });
         res.json({ criminal: updated, registration: (data as any)?.registration ?? null });
     } catch (error) {

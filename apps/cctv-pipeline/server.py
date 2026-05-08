@@ -1,7 +1,7 @@
 """
 CCTV Pipeline — Flask REST API Server
 Exposes YOLOv8 person detection, face detection, criminal DB matching,
-and LBPH-based real-time face recognition to the Node.js backend via HTTP.
+ArcFace/LBPH face recognition, and OSNet ReID fallback to the Node.js backend via HTTP.
 
 Run: python server.py
 Listens on port 3600 by default.
@@ -485,8 +485,8 @@ def sync_subjects_endpoint():
 
 
 if __name__ == "__main__":
-    # Pre-train model on startup if samples exist
-    print("[CCTV Pipeline] Pre-training LBPH model...")
+    # Pre-train identity galleries on startup if samples exist.
+    print("[CCTV Pipeline] Pre-training identity models...")
     train_model()
 
     host = os.environ.get("CCTV_HOST", "127.0.0.1")
