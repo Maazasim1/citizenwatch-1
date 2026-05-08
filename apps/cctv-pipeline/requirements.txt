@@ -9,3 +9,4 @@ onnxruntime
 torch
 torchvision
 torchreid
+gdown
