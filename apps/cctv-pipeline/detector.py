@@ -11,18 +11,43 @@ from pathlib import Path
 
 # Global model reference (lazy-loaded)
 _model = None
+_yolo_device = None
 
 DETECTIONS_DIR = os.path.join(os.path.dirname(__file__), "detections")
 os.makedirs(DETECTIONS_DIR, exist_ok=True)
 
 
+def _resolve_yolo_device():
+    """Pick GPU device when available, allow override via YOLO_DEVICE env."""
+    override = os.environ.get("YOLO_DEVICE")
+    if override:
+        return override
+    try:
+        import torch  # type: ignore
+        if torch.cuda.is_available():
+            return 0
+    except Exception:
+        pass
+    return "cpu"
+
+
 def get_model():
     """Lazy-load YOLOv8 model. Downloads yolov8n.pt on first run (~6MB)."""
-    global _model
+    global _model, _yolo_device
     if _model is None:
         from ultralytics import YOLO
-        _model = YOLO("yolov8n.pt")  # nano model for speed on CPU
+        _model = YOLO("yolov8n.pt")
+        _yolo_device = _resolve_yolo_device()
+        try:
+            _model.to(_yolo_device)
+        except Exception:
+            pass
+        print(f"[Detector] YOLOv8 ready device={_yolo_device}")
     return _model
+
+
+def _yolo_device_for_inference():
+    return _yolo_device if _yolo_device is not None else _resolve_yolo_device()
 
 
 def detect_person_boxes_in_frame(frame, confidence_threshold: float = 0.4):
@@ -34,7 +59,7 @@ def detect_person_boxes_in_frame(frame, confidence_threshold: float = 0.4):
         return []
 
     model = get_model()
-    results = model(frame, verbose=False)
+    results = model(frame, verbose=False, device=_yolo_device_for_inference())
     detections = []
 
     for result in results:
@@ -73,7 +98,7 @@ def detect_persons_in_image(image_path: str, confidence_threshold: float = 0.4):
     if img is None:
         return {"error": f"Could not read image: {image_path}", "detections": []}
 
-    results = model(img, verbose=False)
+    results = model(img, verbose=False, device=_yolo_device_for_inference())
     detections = []
 
     for result in results:
@@ -143,7 +168,7 @@ def detect_persons_in_video(video_path: str, sample_every_n_frames: int = 30,
             break
 
         if frame_idx % sample_every_n_frames == 0:
-            results = model(frame, verbose=False)
+            results = model(frame, verbose=False, device=_yolo_device_for_inference())
 
             for result in results:
                 boxes = result.boxes

@@ -353,7 +353,7 @@ model CriminalRecord {
   mugshotUrl  String   // URL to stored mugshot
   embeddingId String?  // legacy Python identity id; pgvector IdentityEmbedding is authoritative
   notes       String?
-  sampleCount Int      @default(0) // number of LBPH training samples
+  sampleCount Int      @default(0) // number of registered identity samples
   addedById   String?  // law enforcement user who added
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
@@ -391,7 +391,7 @@ model FaceMatch {
   detectionId     String?
   detection       CctvDetection? @relation(fields: [detectionId], references: [id])
   detectionSource MatchSource    @default(CCTV)
-  confidence      Float          // cosine similarity 0-1 or LBPH distance
+  confidence      Float          // normalized confidence score (0-1)
   latitude        Float?
   longitude       Float?
   spottedAt       DateTime?      // when criminal was spotted in live feed

@@ -19,7 +19,6 @@ const CCTV_PIPELINE_URL = process.env.CCTV_PIPELINE_URL || 'http://localhost:360
 const DEBUG_RUN_ID = `criminal-db-${Date.now()}`;
 const LIVE_DEDUP_WINDOW_MS = 2 * 60 * 1000;
 const SAME_LOCATION_EPSILON = 0.0005; // ~55m at equator
-const MIN_ENROLL_SAMPLES = Number(process.env.MIN_CRIMINAL_FACE_SAMPLES || 5);
 const ALERT_CONFIRM_HITS = Number(process.env.CCTV_ALERT_CONFIRM_HITS || 3);
 const ALERT_CONFIRM_WINDOW_MS = Number(process.env.CCTV_ALERT_CONFIRM_WINDOW_MS || 12000);
 const ALERT_CONFIRM_MIN_AVG_CONF = Number(process.env.CCTV_ALERT_CONFIRM_MIN_AVG_CONF || 0.72);
@@ -794,15 +793,6 @@ router.post('/register-criminal-samples', authenticate, requireRole('LAW_ENFORCE
         if (totalForwardedSamples === 0) {
             return res.status(400).json({
                 error: 'No valid sample images were provided. Capture at least 1 webcam image or upload at least 1 file.',
-            });
-        }
-
-        if (!appendMode && totalForwardedSamples < MIN_ENROLL_SAMPLES) {
-            return res.status(400).json({
-                error: `New enrollments require at least ${MIN_ENROLL_SAMPLES} sample images (different angles/lighting). You sent ${totalForwardedSamples}.`,
-                code: 'INSUFFICIENT_SAMPLES',
-                minRequired: MIN_ENROLL_SAMPLES,
-                provided: totalForwardedSamples,
             });
         }
 

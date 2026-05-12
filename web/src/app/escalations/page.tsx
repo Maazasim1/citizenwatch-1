@@ -4,7 +4,8 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { AlertOctagon, Eye, CheckCircle, History, Gavel, RefreshCw } from 'lucide-react';
 import Navbar from '../../components/Navbar';
 import { useAuth } from '../../context/AuthContext';
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL || 'http://localhost:3001';
+import { getApiBaseUrl } from '@/lib/apiBase';
+import { authFetch } from '@/lib/authFetch';
 
 interface Report {
     id: string;
@@ -72,12 +73,8 @@ export default function EscalationsPage() {
             return;
         }
         const [escRes, verRes] = await Promise.all([
-            fetch(`${API_BASE}/api/reports?status=ESCALATED`, {
-                headers: { Authorization: `Bearer ${token}` },
-            }),
-            fetch(`${API_BASE}/api/reports?status=VERIFIED&includeResolved=true&timeRange=all`, {
-                headers: { Authorization: `Bearer ${token}` },
-            }),
+            authFetch(`${getApiBaseUrl()}/api/reports?status=ESCALATED`, {}, token),
+            authFetch(`${getApiBaseUrl()}/api/reports?status=VERIFIED&includeResolved=true&timeRange=all`, {}, token),
         ]);
         const escData = await escRes.json().catch(() => ({}));
         const verData = await verRes.json().catch(() => ({}));
@@ -102,9 +99,7 @@ export default function EscalationsPage() {
         if (!token || !selected || !canResolve) return;
         let cancelled = false;
         (async () => {
-            const res = await fetch(`${API_BASE}/api/reports/${selected.id}/resolution-history`, {
-                headers: { Authorization: `Bearer ${token}` },
-            });
+            const res = await authFetch(`${getApiBaseUrl()}/api/reports/${selected.id}/resolution-history`, {}, token);
             const data = await res.json().catch(() => ({}));
             if (!cancelled && res.ok) setHistory(Array.isArray(data.history) ? data.history : []);
         })();
@@ -126,14 +121,11 @@ export default function EscalationsPage() {
 
         setRemoving(true);
         try {
-            const res = await fetch(`${API_BASE}/api/reports/${selected.id}/remove-escalation`, {
+            const res = await authFetch(`${getApiBaseUrl()}/api/reports/${selected.id}/remove-escalation`, {
                 method: 'PATCH',
-                headers: {
-                    'Content-Type': 'application/json',
-                    Authorization: `Bearer ${token}`,
-                },
+                headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ reason }),
-            });
+            }, token);
             const data = await res.json().catch(() => ({}));
             if (!res.ok) {
                 setActionError(data.error || 'Failed to remove escalation');
@@ -154,14 +146,11 @@ export default function EscalationsPage() {
         setBusy(true);
         setActionError('');
         try {
-            const res = await fetch(`${API_BASE}/api/reports/${selected.id}/resolve`, {
+            const res = await authFetch(`${getApiBaseUrl()}/api/reports/${selected.id}/resolve`, {
                 method: 'POST',
-                headers: {
-                    Authorization: `Bearer ${token}`,
-                    'Content-Type': 'application/json',
-                },
+                headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ tag, notes, confirmed }),
-            });
+            }, token);
             const data = await res.json().catch(() => ({}));
             if (!res.ok) throw new Error(data.error || 'Resolve failed');
             await loadReports();
@@ -178,14 +167,11 @@ export default function EscalationsPage() {
         setBusy(true);
         setActionError('');
         try {
-            const res = await fetch(`${API_BASE}/api/reports/${selected.id}/reopen`, {
+            const res = await authFetch(`${getApiBaseUrl()}/api/reports/${selected.id}/reopen`, {
                 method: 'POST',
-                headers: {
-                    Authorization: `Bearer ${token}`,
-                    'Content-Type': 'application/json',
-                },
+                headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ notes: reopenNotes }),
-            });
+            }, token);
             const data = await res.json().catch(() => ({}));
             if (!res.ok) throw new Error(data.error || 'Reopen failed');
             await loadReports();

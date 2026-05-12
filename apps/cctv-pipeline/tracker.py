@@ -86,10 +86,13 @@ class PersonIdentityTrack:
             )
             if voted_locked:
                 self._disagreement_streak = 0
-            elif voted_other_strong or not observations:
+            elif voted_other_strong:
                 self._disagreement_streak += 1
-            elif not any(o.name for o in observations):
-                self._disagreement_streak += 1
+            else:
+                # Keep the lock when the same motion track is still present but
+                # current frame has no confident identity evidence (face hidden,
+                # blur, occlusion, profile turn). Unlock only on strong conflict.
+                self._disagreement_streak = max(0, self._disagreement_streak - 1)
 
         self._update_lock()
 

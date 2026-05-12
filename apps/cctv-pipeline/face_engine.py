@@ -39,11 +39,16 @@ def _next_frame_no(camera_id: str) -> int:
         return n
 
 
+def _global_reid_cache_sweep_locked(now: float) -> None:
+    """Prune expired entries. Caller must hold _global_reid_lock."""
+    _global_reid_cache[:] = [e for e in _global_reid_cache if e["expires"] > now]
+
+
 def _global_reid_cache_sweep() -> None:
     import time
     now = time.monotonic()
     with _global_reid_lock:
-        _global_reid_cache[:] = [e for e in _global_reid_cache if e["expires"] > now]
+        _global_reid_cache_sweep_locked(now)
 
 
 def _global_reid_lookup(body_emb: np.ndarray | None) -> tuple[str, float] | None:
@@ -72,7 +77,8 @@ def _push_global_reid(name: str, body_emb: np.ndarray | None) -> None:
     ttl = float(os.environ.get("GLOBAL_REID_CACHE_TTL_SEC", "300"))
     maxn = int(os.environ.get("GLOBAL_REID_CACHE_MAX", "80"))
     with _global_reid_lock:
-        _global_reid_cache_sweep()
+        # Avoid nested lock acquisition (_global_reid_cache_sweep() also locks).
+        _global_reid_cache_sweep_locked(time.monotonic())
         _global_reid_cache.append(
             {"name": name, "emb": body_emb.astype(np.float32), "expires": time.monotonic() + ttl}
         )
@@ -118,18 +124,18 @@ FACE_WIDTH = 112
 FACE_HEIGHT = 92
 HISTOGRAM_MATCH_THRESHOLD = 0.78
 HISTOGRAM_STRONG_MATCH_THRESHOLD = 0.84
-ARCFACE_MATCH_THRESHOLD = float(os.environ.get("ARCFACE_MATCH_THRESHOLD", "0.5"))
+ARCFACE_MATCH_THRESHOLD = float(os.environ.get("ARCFACE_MATCH_THRESHOLD", "0.62"))
 ARCFACE_STRONG_MATCH_THRESHOLD = float(os.environ.get("ARCFACE_STRONG_MATCH_THRESHOLD", "0.62"))
-REID_MATCH_THRESHOLD = float(os.environ.get("REID_MATCH_THRESHOLD", "0.72"))
+REID_MATCH_THRESHOLD = float(os.environ.get("REID_MATCH_THRESHOLD", "0.60"))
 REID_STRONG_MATCH_THRESHOLD = float(os.environ.get("REID_STRONG_MATCH_THRESHOLD", "0.82"))
-EMBEDDING_TOP2_MARGIN = 0.02
+EMBEDDING_TOP2_MARGIN = float(os.environ.get("EMBEDDING_TOP2_MARGIN", "0.08"))
 LIVE_PERSON_DETECTION_THRESHOLD = float(os.environ.get("LIVE_PERSON_DETECTION_THRESHOLD", "0.45"))
 VERBOSE_RECOGNITION_LOGS = os.environ.get("VERBOSE_RECOGNITION_LOGS", "1").lower() in {"1", "true", "yes", "on"}
 ALERT_MIN_TRACK_AGE = int(os.environ.get("ALERT_MIN_TRACK_AGE", "20"))
 ALERT_MIN_LOCKED_CONF = float(os.environ.get("ALERT_MIN_LOCKED_CONF", "0.72"))
 ALERT_MIN_FACE_FRAMES = int(os.environ.get("ALERT_MIN_FACE_FRAMES", "2"))
 LOCK_WEIGHT_THRESHOLD = float(os.environ.get("TRACKER_LOCK_WEIGHT_THRESHOLD", "5.0"))
-LOCK_MIN_AVG_CONF = float(os.environ.get("TRACKER_LOCK_MIN_AVG_CONF", "0.62"))
+LOCK_MIN_AVG_CONF = float(os.environ.get("TRACKER_LOCK_MIN_AVG_CONF", "0.75"))
 IDENTITY_MAX_MISSED = int(os.environ.get("IDENTITY_MAX_MISSED_FRAMES", "90"))
 
 
@@ -236,12 +242,16 @@ def _body_vote_from_embedding(query_reid: dict | None) -> tuple[str | None, floa
         return None, 0.0, False
     best_name, best_sim, second_best_sim = _best_gallery_match(query_reid, _subject_reid_gallery)
     margin_ok = second_best_sim > 0.0 and (best_sim - second_best_sim) >= EMBEDDING_TOP2_MARGIN
+    # At least REID_MATCH_THRESHOLD similarity, and either strong match or a clear margin vs 2nd-best.
     acceptable = (
         best_name is not None
         and best_sim >= REID_MATCH_THRESHOLD
         and (best_sim >= REID_STRONG_MATCH_THRESHOLD or margin_ok)
     )
-    return best_name, float(best_sim), acceptable
+    # Never treat a below-threshold runner-up as a candidate (avoids wrong labels from weak ReID).
+    if not acceptable:
+        return None, float(best_sim), False
+    return best_name, float(best_sim), True
 
 
 def _embedding_to_entry(embedding: IdentityEmbedding | np.ndarray | None, fallback_model: str = "opencv_histogram_v1"):
@@ -600,17 +610,25 @@ def recognize_faces_in_frame(frame, camera_id: str = "default"):
         if tr.locked_name and tr.locked_name != prev_lock:
             _push_global_reid(tr.locked_name, _entry_vector(query_reid))
 
-        is_match = tr.locked_name is not None
+        # Do not show a "locked identity" until we have enough face-backed evidence.
+        # This reduces body/global-only false positives between visually similar people.
+        is_match = tr.locked_name is not None and tr.face_vote_frames >= ALERT_MIN_FACE_FRAMES
         name = tr.locked_name if is_match else "Unknown"
         out_conf = round(float(tr.locked_confidence), 4) if is_match else 0.0
 
-        tent_face = emb_name
-        tent_conf = float(emb_conf)
-        tent_body = body_name
-        body_tent_conf = float(body_conf)
+        tent_face = emb_name if emb_ok else None
+        tent_conf = float(emb_conf) if emb_ok else 0.0
+        tent_body = body_name if body_ok else None
+        body_tent_conf = float(body_conf) if body_ok else 0.0
         if tent_face is None and tent_body and body_ok:
             tent_face = tent_body
             tent_conf = body_tent_conf
+
+        # Pending label: only face (accepted) or body (accepted ≥ configured ReID threshold).
+        pending_show_name = bool(
+            (emb_ok and emb_name)
+            or (body_ok and tent_body)
+        )
 
         if is_match:
             color = (0, 0, 255)
@@ -622,7 +640,7 @@ def recognize_faces_in_frame(frame, camera_id: str = "default"):
                 confidence=out_conf,
                 details=f"motion_id={motion_id} age={tr.age} face_frames={tr.face_vote_frames}",
             )
-        elif tent_face and (emb_ok or body_ok):
+        elif pending_show_name:
             color = (0, 215, 255)
             label = f"#{motion_id} ?{tent_face}? {int(tent_conf * 100)}%"
             method = "person_track_pending"
@@ -657,7 +675,7 @@ def recognize_faces_in_frame(frame, camera_id: str = "default"):
 
         serialized = _serialize_identity_embeddings(
             face_entries=[query_embedding] if query_embedding else [],
-            reid_entries=[query_reid] if query_reid is not None else [],
+            reid_entries=[query_reid] if body_ok and query_reid is not None else [],
         )
 
         alert_eligible = bool(
@@ -681,15 +699,20 @@ def recognize_faces_in_frame(frame, camera_id: str = "default"):
             "track_id": motion_id,
             "track_age": tr.age,
             "face_vote_frames": tr.face_vote_frames,
-            "tentative_name": tent_face,
-            "tentative_confidence": round(float(tent_conf), 4),
+            "tentative_name": tent_face if (not is_match and pending_show_name) else None,
+            "tentative_confidence": round(float(tent_conf), 4) if (not is_match and pending_show_name and tent_face) else 0.0,
             "vote_sources": {
-                "face": {"name": emb_name, "score": round(float(emb_conf), 4), "accepted": emb_ok},
-                "body": {"name": body_name, "score": round(float(body_conf), 4), "accepted": body_ok},
+                "face": {
+                    "name": emb_name if emb_ok else None,
+                    "score": round(float(emb_conf), 4) if emb_ok else None,
+                    "accepted": emb_ok,
+                },
+                "body": {
+                    "name": body_name if body_ok else None,
+                    "score": round(float(body_conf), 4) if body_ok else None,
+                    "accepted": body_ok,
+                },
             },
-            "reid_best_match_name": body_name,
-            "reid_best_match_score": round(float(body_conf), 4),
-            "reid_threshold": REID_MATCH_THRESHOLD,
             "identity_backend": _entry_model(query_embedding) if query_embedding else (
                 _entry_model(query_reid) if query_reid else None
             ),
@@ -707,7 +730,7 @@ def _safe_subject_name(name: str) -> str:
     return safe.replace(" ", "_") or "unknown_subject"
 
 
-MIN_CRIMINAL_FACE_SAMPLES = int(os.environ.get("MIN_CRIMINAL_FACE_SAMPLES", "5"))
+MIN_CRIMINAL_FACE_SAMPLES = int(os.environ.get("MIN_CRIMINAL_FACE_SAMPLES", "1"))
 
 
 def register_criminal_samples(name: str, images_data: list, fir_number: str = "", append: bool = False):
@@ -762,21 +785,6 @@ def register_criminal_samples(name: str, images_data: list, fir_number: str = ""
     if saved_count < 1:
         shutil.rmtree(temp_dir, ignore_errors=True)
         return None
-
-    if not append and saved_count < MIN_CRIMINAL_FACE_SAMPLES:
-        shutil.rmtree(temp_dir, ignore_errors=True)
-        if os.path.isdir(originals_dir):
-            shutil.rmtree(originals_dir, ignore_errors=True)
-        return {
-            "error": (
-                f"Enrollment requires at least {MIN_CRIMINAL_FACE_SAMPLES} images with detectable faces. "
-                f"Got {saved_count}."
-            ),
-            "code": "INSUFFICIENT_SAMPLES",
-            "failed_captures": failed,
-            "sample_count": saved_count,
-            "min_required": MIN_CRIMINAL_FACE_SAMPLES,
-        }
 
     # Move temp to final (overwrite or append).
     if append and os.path.isdir(person_dir):

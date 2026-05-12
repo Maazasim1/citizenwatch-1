@@ -4,7 +4,7 @@ import { useEffect, useState } from 'react';
 import { io } from 'socket.io-client';
 import { AlertTriangle, X, MapPin, User, ShieldAlert } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL || 'http://localhost:3001';
+import { getApiBaseUrl } from '@/lib/apiBase';
 
 interface CriminalMatch {
     matchId: string;
@@ -25,7 +25,7 @@ export default function CriminalMatchAlert() {
         // Only admins/moderators/law enforcement should see these alerts
         if (!user || user.role === 'CITIZEN') return;
 
-        const socket = io(API_BASE);
+        const socket = io(getApiBaseUrl());
 
         socket.on('criminal:matched', (data: CriminalMatch) => {
             setMatches((prev) => [...prev, data]);

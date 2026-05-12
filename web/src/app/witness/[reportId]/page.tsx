@@ -5,7 +5,8 @@ import Link from 'next/link';
 import { useParams } from 'next/navigation';
 import Navbar from '../../../components/Navbar';
 import { useAuth } from '../../../context/AuthContext';
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL || 'http://localhost:3001';
+import { getApiBaseUrl } from '@/lib/apiBase';
+import { authFetch } from '@/lib/authFetch';
 
 type InviteState =
     | { loading: true }
@@ -46,9 +47,7 @@ export default function WitnessRespondPage() {
         let cancelled = false;
         (async () => {
             try {
-                const res = await fetch(`${API_BASE}/api/reports/${reportId}/witness-invite`, {
-                    headers: { Authorization: `Bearer ${token}` },
-                });
+                const res = await authFetch(`${getApiBaseUrl()}/api/reports/${reportId}/witness-invite`, {}, token);
                 const data = await res.json().catch(() => ({}));
                 if (!res.ok) throw new Error(data.error || 'Failed to load invite');
                 if (cancelled) return;
@@ -77,17 +76,14 @@ export default function WitnessRespondPage() {
         setSubmitting(true);
         setDoneMessage('');
         try {
-            const res = await fetch(`${API_BASE}/api/reports/${reportId}/witness-respond`, {
+            const res = await authFetch(`${getApiBaseUrl()}/api/reports/${reportId}/witness-respond`, {
                 method: 'POST',
-                headers: {
-                    Authorization: `Bearer ${token}`,
-                    'Content-Type': 'application/json',
-                },
+                headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     response,
                     note: response === 'CORROBORATED' ? note : undefined,
                 }),
-            });
+            }, token);
             const data = await res.json().catch(() => ({}));
             if (!res.ok) throw new Error(data.error || 'Could not save your response');
             setInvite((prev) =>

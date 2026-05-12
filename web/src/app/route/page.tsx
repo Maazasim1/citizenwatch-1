@@ -7,6 +7,7 @@ import RouteAnalyticsPanel from '../../components/RouteAnalyticsPanel';
 import type { HotspotCluster } from '../../components/MapComponent';
 import { useAuth } from '../../context/AuthContext';
 import { useRouter } from 'next/navigation';
+import { getApiBaseUrl } from '@/lib/apiBase';
 
 const DEFAULT_START = { latitude: 24.8607, longitude: 67.0011 } as const;
 const DEFAULT_END = { latitude: 24.8715, longitude: 67.0305 } as const;
@@ -40,7 +41,6 @@ const RouteMap = dynamic(() => import('../../components/RouteMap'), {
     ssr: false,
     loading: () => <div className="w-full h-[420px] bg-slate-900 rounded-2xl animate-pulse" />,
 });
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL || 'http://localhost:3001';
 
 export default function RoutePage() {
     const { user, loading: authLoading } = useAuth();
@@ -102,7 +102,7 @@ export default function RoutePage() {
     }, [start, end]);
 
     const searchGeocode = async (query: string): Promise<Suggestion[]> => {
-        const res = await fetch(`${API_BASE}/api/geocode?query=${encodeURIComponent(query)}&limit=6`);
+        const res = await fetch(`${getApiBaseUrl()}/api/geocode?query=${encodeURIComponent(query)}&limit=6`);
         if (!res.ok) return [];
         const data = await res.json();
         return (data?.results ?? []) as Suggestion[];
@@ -150,8 +150,8 @@ export default function RoutePage() {
             const params = new URLSearchParams({ timeRange: mapTimeRange });
             try {
                 const [repRes, hotRes] = await Promise.all([
-                    fetch(`${API_BASE}/api/reports?${params.toString()}`),
-                    fetch(`${API_BASE}/api/hotspots?${params.toString()}`),
+                    fetch(`${getApiBaseUrl()}/api/reports?${params.toString()}`),
+                    fetch(`${getApiBaseUrl()}/api/hotspots?${params.toString()}`),
                 ]);
                 if (cancelled) return;
                 if (repRes.ok) {
@@ -218,7 +218,7 @@ export default function RoutePage() {
         }
         setLoading(true);
         try {
-            const res = await fetch(`${API_BASE}/api/routes/compute`, {
+            const res = await fetch(`${getApiBaseUrl()}/api/routes/compute`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(computePayload),

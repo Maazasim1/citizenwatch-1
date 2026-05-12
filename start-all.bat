@@ -1,4 +1,5 @@
 @echo off
+cd /d "%~dp0"
 echo Starting Citizenwatch MVP Infrastructure...
 echo ==============================================
 
@@ -8,28 +9,28 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "  $lines = netstat -ano | Select-String (':'+$p+'\\s+.*LISTENING'); " ^
   "  foreach ($line in $lines) { " ^
   "    $parts = ($line.ToString().Trim() -split '\s+'); " ^
-  "    $pid = $parts[$parts.Length-1]; " ^
-  "    if ($pid -match '^\d+$') { " ^
-  "      Write-Host ('   Port ' + $p + ' busy with PID ' + $pid + ' - terminating process...'); " ^
-  "      Stop-Process -Id ([int]$pid) -Force -ErrorAction SilentlyContinue; " ^
+  "    $procId = $parts[$parts.Length-1]; " ^
+  "    if ($procId -match '^\d+$') { " ^
+  "      Write-Host ('   Port ' + $p + ' busy with PID ' + $procId + ' - terminating process...'); " ^
+  "      Stop-Process -Id ([int]$procId) -Force -ErrorAction SilentlyContinue; " ^
   "    } " ^
   "  } " ^
   "}"
 
 echo [1] Starting Docker containers (PostgreSQL ^& Redis)...
-start "Docker Compose" cmd /k "docker-compose up -d && echo. && echo Docker containers started! You can close this window if you want or keep it to check status with 'docker ps'."
+start "Docker Compose" cmd /k "cd /d ""%~dp0"" && docker-compose up -d && echo. && echo Docker containers started! You can close this window if you want or keep it to check status with 'docker ps'."
 
 echo [2] Waiting 5 seconds for databases to initialize...
 timeout /t 5 /nobreak >nul
 
 echo [3] Starting Python CCTV Pipeline (Port 3600)...
-start "CCTV Python Pipeline" cmd /k "cd apps\cctv-pipeline && .\venv\Scripts\activate && python server.py"
+start "CCTV Python Pipeline" cmd /k "cd /d ""%~dp0apps\cctv-pipeline"" && .\venv\Scripts\activate && python server.py"
 
 echo [4] Starting Node.js API Server (Port 3001)...
-start "Node.js API Server" cmd /k "cd apps\api && npm run dev"
+start "Node.js API Server" cmd /k "cd /d ""%~dp0apps\api"" && npm run dev"
 
 echo [5] Starting Next.js Frontend (Port 3000)...
-start "Next.js Frontend" cmd /k "cd web && npm run dev"
+start "Next.js Frontend" cmd /k "cd /d ""%~dp0web"" && npm run dev"
 
 echo ==============================================
 echo All services have been launched in separate windows!

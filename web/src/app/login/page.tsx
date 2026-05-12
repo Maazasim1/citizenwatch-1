@@ -12,6 +12,7 @@ export default function LoginPage() {
     const [tab, setTab] = useState<'login' | 'register'>('login');
     const [email, setEmail] = useState('');
     const [password, setPassword] = useState('');
+    const [registerRole, setRegisterRole] = useState<'CITIZEN' | 'MODERATOR' | 'LAW_ENFORCEMENT'>('CITIZEN');
     const [showPassword, setShowPassword] = useState(false);
     
     // OTP State
@@ -39,7 +40,11 @@ export default function LoginPage() {
         }
 
         const fn = tab === 'login' ? login : register;
-        const result = await fn({ email, password });
+        const result = await fn(
+            tab === 'register'
+                ? { email, password, role: registerRole }
+                : { email, password }
+        );
         setLoading(false);
         if (result.error) {
             setError(result.error);
@@ -167,6 +172,23 @@ export default function LoginPage() {
                                 </button>
                             </div>
                         </div>
+
+                        {tab === 'register' && (
+                            <div>
+                                <label className="text-xs font-semibold uppercase tracking-widest text-slate-400 mb-1.5 block">
+                                    Register As
+                                </label>
+                                <select
+                                    value={registerRole}
+                                    onChange={(e) => setRegisterRole(e.target.value as 'CITIZEN' | 'MODERATOR' | 'LAW_ENFORCEMENT')}
+                                    className="w-full bg-slate-950 border border-slate-700 rounded-xl px-4 py-3 text-sm text-slate-100 focus:outline-none focus:border-indigo-500 transition-colors"
+                                >
+                                    <option value="CITIZEN">Citizen</option>
+                                    <option value="MODERATOR">Moderator</option>
+                                    <option value="LAW_ENFORCEMENT">Police / Law Enforcement</option>
+                                </select>
+                            </div>
+                        )}
 
                         {/* Error message */}
                         {error && (

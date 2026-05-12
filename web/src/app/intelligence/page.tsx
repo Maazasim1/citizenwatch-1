@@ -11,7 +11,8 @@ import {
     User, MapPin, Camera, TrendingUp, Search, Trash2
 } from 'lucide-react';
 
-const API = process.env.NEXT_PUBLIC_API_BASE_URL || 'http://localhost:3001';
+import { getApiBaseUrl } from '@/lib/apiBase';
+import { authFetch } from '@/lib/authFetch';
 const MiniLocationMap = dynamic(() => import('../../components/MiniLocationMap'), {
     ssr: false,
 });
@@ -81,7 +82,7 @@ export default function IntelligencePage() {
     // WebSocket for live alerts
     useEffect(() => {
         if (!user || !canAccess) return;
-        const socket = io(API);
+        const socket = io(getApiBaseUrl());
         socket.on('criminal:matched', (data: any) => {
             setLiveAlerts(prev => [data, ...prev].slice(0, 10));
             // Refresh intelligence feed
@@ -93,9 +94,7 @@ export default function IntelligencePage() {
     const fetchIntelligence = async () => {
         setIsLoading(true);
         try {
-            const res = await fetch(`${API}/api/cctv/intelligence-feed`, {
-                headers: { Authorization: `Bearer ${token}` },
-            });
+            const res = await authFetch(`${getApiBaseUrl()}/api/cctv/intelligence-feed`, {}, token);
             if (res.ok) {
                 const data = await res.json();
                 setMatches(data.matches || []);
@@ -110,14 +109,11 @@ export default function IntelligencePage() {
 
     const handleReview = async (matchId: string, status: 'CONFIRMED' | 'DISMISSED') => {
         try {
-            const res = await fetch(`${API}/api/cctv/matches/${matchId}/review`, {
+            const res = await authFetch(`${getApiBaseUrl()}/api/cctv/matches/${matchId}/review`, {
                 method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    Authorization: `Bearer ${token}`,
-                },
+                headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ status }),
-            });
+            }, token);
             if (res.ok) {
                 fetchIntelligence();
                 setSelected(prev => prev?.id === matchId ? { ...prev, reviewStatus: status } : prev);
@@ -129,10 +125,7 @@ export default function IntelligencePage() {
 
     const handleDeleteMatch = async (matchId: string) => {
         try {
-            const res = await fetch(`${API}/api/cctv/matches/${matchId}`, {
-                method: 'DELETE',
-                headers: { Authorization: `Bearer ${token}` },
-            });
+            const res = await authFetch(`${getApiBaseUrl()}/api/cctv/matches/${matchId}`, { method: 'DELETE' }, token);
             if (res.ok) {
                 setMatches(prev => prev.filter(m => m.id !== matchId));
                 setSelected(prev => (prev?.id === matchId ? null : prev));
@@ -145,10 +138,7 @@ export default function IntelligencePage() {
 
     const handleClearMatches = async () => {
         try {
-            const res = await fetch(`${API}/api/cctv/matches`, {
-                method: 'DELETE',
-                headers: { Authorization: `Bearer ${token}` },
-            });
+            const res = await authFetch(`${getApiBaseUrl()}/api/cctv/matches`, { method: 'DELETE' }, token);
             if (res.ok) {
                 setMatches([]);
                 setSelected(null);

@@ -4,7 +4,8 @@ import { useEffect, useState } from 'react';
 import Link from 'next/link';
 import Navbar from '../../components/Navbar';
 import { useAuth } from '../../context/AuthContext';
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL || 'http://localhost:3001';
+import { getApiBaseUrl } from '@/lib/apiBase';
+import { authFetch } from '@/lib/authFetch';
 
 type Role = 'CITIZEN' | 'MODERATOR' | 'LAW_ENFORCEMENT' | 'ADMIN';
 type Sex = 'MALE' | 'FEMALE' | 'UNDISCLOSED';
@@ -68,9 +69,7 @@ export default function ProfilePage() {
         let cancelled = false;
         (async () => {
             try {
-                const res = await fetch(`${API_BASE}/api/profile`, {
-                    headers: { Authorization: `Bearer ${token}` },
-                });
+                const res = await authFetch(`${getApiBaseUrl()}/api/profile`, {}, token);
                 const data = await res.json().catch(() => ({}));
                 if (!res.ok || cancelled) return;
                 const u: ProfilePayload | undefined = data.profile;
@@ -122,14 +121,11 @@ export default function ProfilePage() {
                 return;
             }
 
-            const res = await fetch(`${API_BASE}/api/profile`, {
+            const res = await authFetch(`${getApiBaseUrl()}/api/profile`, {
                 method: 'PATCH',
-                headers: {
-                    Authorization: `Bearer ${token}`,
-                    'Content-Type': 'application/json',
-                },
+                headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(body),
-            });
+            }, token);
             const data = await res.json().catch(() => ({}));
             if (!res.ok) throw new Error(data.error || 'Save failed');
             const u: ProfilePayload | undefined = data.profile;
@@ -158,11 +154,10 @@ export default function ProfilePage() {
         try {
             const fd = new FormData();
             fd.append('avatar', file);
-            const res = await fetch(`${API_BASE}/api/profile/avatar`, {
+            const res = await authFetch(`${getApiBaseUrl()}/api/profile/avatar`, {
                 method: 'POST',
-                headers: { Authorization: `Bearer ${token}` },
                 body: fd,
-            });
+            }, token);
             const data = await res.json().catch(() => ({}));
             if (!res.ok) throw new Error(data.error || 'Avatar upload failed');
             setProfile((prev) =>

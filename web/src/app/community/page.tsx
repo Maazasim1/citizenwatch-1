@@ -6,7 +6,8 @@ import { MapPin, ThumbsUp, ThumbsDown, LogIn } from 'lucide-react';
 import Link from 'next/link';
 import Navbar from '../../components/Navbar';
 import { useAuth } from '../../context/AuthContext';
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL || 'http://localhost:3001';
+import { getApiBaseUrl } from '@/lib/apiBase';
+import { authFetch } from '@/lib/authFetch';
 
 type VoteType = 'CONFIRM' | 'DISPUTE';
 
@@ -38,16 +39,10 @@ export default function CommunityPage() {
     const [loading, setLoading] = useState(true);
     const [actionError, setActionError] = useState<Record<string, string>>({});
 
-    const headers = (): HeadersInit => {
-        const h: HeadersInit = {};
-        if (token) h.Authorization = `Bearer ${token}`;
-        return h;
-    };
-
     const load = useCallback(async () => {
         setLoading(true);
         try {
-            const res = await fetch(`${API_BASE}/api/reports/community-dashboard`, { headers: headers() });
+            const res = await authFetch(`${getApiBaseUrl()}/api/reports/community-dashboard`, {}, token);
             const data = await res.json().catch(() => ({}));
             if (!res.ok) throw new Error(data.error || 'Failed to load dashboard');
             setVerified(Array.isArray(data.verified) ? data.verified : []);
@@ -66,7 +61,7 @@ export default function CommunityPage() {
     }, [load]);
 
     useEffect(() => {
-        const socket: Socket = io(API_BASE);
+        const socket: Socket = io(getApiBaseUrl());
         socket.on('report:voted', () => {
             void load();
         });
@@ -91,11 +86,11 @@ export default function CommunityPage() {
             return;
         }
         try {
-            const res = await fetch(`${API_BASE}/api/reports/${reportId}/vote`, {
+            const res = await authFetch(`${getApiBaseUrl()}/api/reports/${reportId}/vote`, {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json', ...headers() },
+                headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ voteType }),
-            });
+            }, token);
             const data = await res.json().catch(() => ({}));
             if (!res.ok) {
                 const msg =
@@ -117,10 +112,7 @@ export default function CommunityPage() {
         setActionError((prev) => ({ ...prev, [reportId]: '' }));
         if (!token) return;
         try {
-            const res = await fetch(`${API_BASE}/api/reports/${reportId}/vote`, {
-                method: 'DELETE',
-                headers: headers(),
-            });
+            const res = await authFetch(`${getApiBaseUrl()}/api/reports/${reportId}/vote`, { method: 'DELETE' }, token);
             const data = await res.json().catch(() => ({}));
             if (!res.ok) {
                 setActionError((prev) => ({ ...prev, [reportId]: data.error || 'Could not remove vote' }));

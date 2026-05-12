@@ -1,6 +1,6 @@
+import './envBootstrap';
 import express, { Express, Request, Response, NextFunction } from 'express';
 import cors from 'cors';
-import dotenv from 'dotenv';
 import fs from 'fs';
 import path from 'path';
 import http from 'http';
@@ -17,8 +17,6 @@ import { prisma } from './db';
 import reportRoutes, { registerReportIo } from './routes/reports';
 import { runCredibilityInactivityDecay } from './services/credibility';
 import { recognizeFrame as recognizeFrameViaPipeline } from './services/cctvStream';
-
-dotenv.config();
 
 const app: Express = express();
 const port = process.env.PORT || 3001;

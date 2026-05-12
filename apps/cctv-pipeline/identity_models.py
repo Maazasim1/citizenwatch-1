@@ -1,8 +1,8 @@
 """
 Modern identity backends for CCTV recognition.
 
-The pipeline keeps OpenCV/LBPH as a compatibility fallback, but this module
-adds lazy-loaded state-of-the-art backends when their dependencies are present:
+The pipeline uses lazy-loaded state-of-the-art identity backends when their
+dependencies are present:
   - InsightFace ArcFace embeddings for face identity.
   - OSNet person ReID embeddings through torchreid for non-frontal/no-face cases.
 """
@@ -18,7 +18,8 @@ import numpy as np
 
 
 ARCFACE_MODEL_NAME = os.environ.get("FACE_MODEL_NAME", "buffalo_l")
-ARCFACE_PROVIDER = os.environ.get("FACE_MODEL_PROVIDER", "CPUExecutionProvider")
+# Prefer CUDA by default when available; can still be overridden via FACE_MODEL_PROVIDER.
+ARCFACE_PROVIDER = os.environ.get("FACE_MODEL_PROVIDER", "CUDAExecutionProvider")
 ARCFACE_DET_SIZE = int(os.environ.get("FACE_MODEL_DET_SIZE", "640"))
 
 REID_MODEL_NAME = os.environ.get("REID_MODEL_NAME", "osnet_x1_0")
@@ -67,12 +68,21 @@ def _get_face_app():
     try:
         from insightface.app import FaceAnalysis
 
-        app = FaceAnalysis(name=ARCFACE_MODEL_NAME, providers=[ARCFACE_PROVIDER])
-        # ctx_id=-1 keeps the pipeline CPU-safe by default.
-        app.prepare(ctx_id=int(os.environ.get("FACE_MODEL_CTX_ID", "-1")), det_size=(ARCFACE_DET_SIZE, ARCFACE_DET_SIZE))
+        # Default to GPU (ctx_id=0) when CUDA provider is requested. ctx_id=-1 forces CPU.
+        default_ctx_id = "0" if "CUDAExecutionProvider" in ARCFACE_PROVIDER else "-1"
+        ctx_id = int(os.environ.get("FACE_MODEL_CTX_ID", default_ctx_id))
+
+        providers = [ARCFACE_PROVIDER]
+        if "CUDAExecutionProvider" in ARCFACE_PROVIDER and "CPUExecutionProvider" not in providers:
+            providers.append("CPUExecutionProvider")
+
+        app = FaceAnalysis(name=ARCFACE_MODEL_NAME, providers=providers)
+        app.prepare(ctx_id=ctx_id, det_size=(ARCFACE_DET_SIZE, ARCFACE_DET_SIZE))
+        print(f"[IdentityModels] InsightFace ready providers={providers} ctx_id={ctx_id}")
         _face_app = app
     except Exception as exc:  # pragma: no cover - depends on optional model packages/downloads.
         _face_app_error = str(exc)
+        print(f"[IdentityModels] InsightFace init failed: {exc}")
         _face_app = None
     return _face_app
 
@@ -109,6 +119,49 @@ def compute_arcface_embedding(image_bgr: np.ndarray) -> Optional[IdentityEmbeddi
     return IdentityEmbedding(vector=_l2_normalize(np.asarray(embedding, dtype=np.float32)), model=f"insightface:{ARCFACE_MODEL_NAME}")
 
 
+def detect_arcface_faces(image_bgr: np.ndarray) -> list:
+    """Return all faces detected by ArcFace with bbox + embedding in one pass.
+
+    This avoids running Haar then ArcFace separately for every face.
+    Each item: {"bbox": (x, y, w, h), "embedding": IdentityEmbedding}
+    """
+    if image_bgr is None or getattr(image_bgr, "size", 0) == 0:
+        return []
+    app = _get_face_app()
+    if app is None:
+        return []
+    try:
+        faces = app.get(image_bgr)
+    except Exception as exc:  # pragma: no cover
+        global _face_app_error
+        _face_app_error = str(exc)
+        return []
+
+    out = []
+    for f in faces:
+        try:
+            x1, y1, x2, y2 = [int(v) for v in f.bbox]
+        except Exception:
+            continue
+        bx, by, bw, bh = x1, y1, max(0, x2 - x1), max(0, y2 - y1)
+        if bw <= 0 or bh <= 0:
+            continue
+        emb = getattr(f, "normed_embedding", None)
+        if emb is None:
+            emb = getattr(f, "embedding", None)
+        if emb is None:
+            continue
+        out.append({
+            "bbox": (bx, by, bw, bh),
+            "score": float(getattr(f, "det_score", 0.0)),
+            "embedding": IdentityEmbedding(
+                vector=_l2_normalize(np.asarray(emb, dtype=np.float32)),
+                model=f"insightface:{ARCFACE_MODEL_NAME}",
+            ),
+        })
+    return out
+
+
 def _get_reid_model():
     global _reid_model, _reid_torch, _reid_device, _reid_error
     if _reid_model is not None or _reid_error is not None:
@@ -134,8 +187,10 @@ def _get_reid_model():
         _reid_torch = torch
         _reid_device = requested_device
         _reid_model = model
+        print(f"[IdentityModels] OSNet ReID ready model={REID_MODEL_NAME} device={requested_device}")
     except Exception as exc:  # pragma: no cover - depends on optional model packages/downloads.
         _reid_error = str(exc)
+        print(f"[IdentityModels] OSNet ReID init failed: {exc}")
         _reid_model = None
     return _reid_model
 
