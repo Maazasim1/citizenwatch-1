@@ -22,6 +22,8 @@ const SAME_LOCATION_EPSILON = 0.0005; // ~55m at equator
 const ALERT_CONFIRM_HITS = Number(process.env.CCTV_ALERT_CONFIRM_HITS || 3);
 const ALERT_CONFIRM_WINDOW_MS = Number(process.env.CCTV_ALERT_CONFIRM_WINDOW_MS || 12000);
 const ALERT_CONFIRM_MIN_AVG_CONF = Number(process.env.CCTV_ALERT_CONFIRM_MIN_AVG_CONF || 0.72);
+/** Criminal list snapshot for live recognition enrichment; refreshed at most this often unless invalidated. */
+const ACTIVE_CRIMINALS_CACHE_TTL_MS = Number(process.env.CCTV_ACTIVE_CRIMINALS_CACHE_TTL_MS ?? '30000');
 
 type PendingLiveAlert = { hits: number; firstTs: number; sumConf: number };
 const pendingLiveAlerts = new Map<string, PendingLiveAlert>();
@@ -390,6 +392,7 @@ router.post('/criminal-db', authenticate, requireRole('LAW_ENFORCEMENT', 'ADMIN'
                 addedById: (req as any).user?.userId || null,
             },
         });
+        invalidateActiveCriminalsRecognitionCache();
         await storeIdentityEmbeddings(record.id, pipelineResult.criminal?.identity_embeddings, { replace: true });
 
         res.status(201).json({ criminal: record });
@@ -514,6 +517,7 @@ router.delete('/criminal-db/:id', authenticate, requireRole('LAW_ENFORCEMENT', '
         await prisma.faceMatch.deleteMany({ where: { criminalId: id } });
         await removeIdentityEmbeddings(id);
         await prisma.criminalRecord.delete({ where: { id } });
+        invalidateActiveCriminalsRecognitionCache();
         await syncPipelineSubjectsWithDb();
         res.json({ success: true });
     } catch (error) {
@@ -850,6 +854,7 @@ router.post('/register-criminal-samples', authenticate, requireRole('LAW_ENFORCE
                 },
             });
         }
+        invalidateActiveCriminalsRecognitionCache();
         await storeIdentityEmbeddings(record.id, registration?.identity_embeddings, { replace: true });
 
         res.status(201).json({ criminal: record, registration });
@@ -894,6 +899,7 @@ router.post('/criminal-db/:id/add-samples', authenticate, requireRole('LAW_ENFOR
                 embeddingId: (data as any)?.registration?.embedding_id || criminal.embeddingId,
             },
         });
+        invalidateActiveCriminalsRecognitionCache();
         await storeIdentityEmbeddings(updated.id, (data as any)?.registration?.identity_embeddings, { replace: true });
         res.json({ criminal: updated, registration: (data as any)?.registration ?? null });
     } catch (error) {
@@ -901,6 +907,32 @@ router.post('/criminal-db/:id/add-samples', authenticate, requireRole('LAW_ENFOR
         res.status(500).json({ error: 'Failed to add samples' });
     }
 });
+
+type ActiveCriminalForRecognition = {
+    id: string;
+    name: string;
+    firNumber: string | null;
+    mugshotUrl: string | null;
+};
+
+let activeCriminalsRecognitionCache: { rows: ActiveCriminalForRecognition[]; loadedAt: number } | null = null;
+
+function invalidateActiveCriminalsRecognitionCache() {
+    activeCriminalsRecognitionCache = null;
+}
+
+async function getActiveCriminalsForRecognition(): Promise<ActiveCriminalForRecognition[]> {
+    const now = Date.now();
+    const cached = activeCriminalsRecognitionCache;
+    if (cached && now - cached.loadedAt < ACTIVE_CRIMINALS_CACHE_TTL_MS) {
+        return cached.rows;
+    }
+    const rows = await prisma.criminalRecord.findMany({
+        select: { id: true, name: true, firNumber: true, mugshotUrl: true },
+    });
+    activeCriminalsRecognitionCache = { rows, loadedAt: now };
+    return rows;
+}
 
 /**
  * Shared post-recognition enrichment: vector match against the criminals DB,
@@ -922,9 +954,7 @@ export async function processRecognitionResult(input: ProcessRecognitionInput) {
     const { pipelineResult, frameSnapshotUrl, cameraLat, cameraLng, cameraId } = input;
     const hasValidLocation = cameraLat != null && !isNaN(cameraLat) && cameraLng != null && !isNaN(cameraLng);
 
-    const activeCriminals = await prisma.criminalRecord.findMany({
-        select: { id: true, name: true, firNumber: true, mugshotUrl: true },
-    });
+    const activeCriminals = await getActiveCriminalsForRecognition();
     const criminalsByNorm = new Map<string, (typeof activeCriminals)[number]>();
     const criminalsById = new Map<string, (typeof activeCriminals)[number]>();
     for (const c of activeCriminals) {
