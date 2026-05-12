@@ -5,8 +5,8 @@ import Navbar from '../../../components/Navbar';
 import { useAuth } from '../../../context/AuthContext';
 import { Plus, User, Search, Upload, FileText, CheckCircle, XCircle, Camera, Video, Aperture, RefreshCw } from 'lucide-react';
 import { useRouter } from 'next/navigation';
-
-const API = process.env.NEXT_PUBLIC_API_BASE_URL || 'http://localhost:3001';
+import { getApiBaseUrl } from '@/lib/apiBase';
+import { authFetch } from '@/lib/authFetch';
 
 interface Criminal {
     id: string;
@@ -76,9 +76,7 @@ export default function CriminalDBPage() {
             let lastErr: unknown = null;
             for (let attempt = 0; attempt < 2; attempt++) {
                 try {
-                    res = await fetch(`${API}/api/cctv/criminal-db`, {
-                        headers: { Authorization: `Bearer ${token}` },
-                    });
+                    res = await authFetch(`${getApiBaseUrl()}/api/cctv/criminal-db`, {}, token);
                     break;
                 } catch (err) {
                     lastErr = err;
@@ -95,7 +93,7 @@ export default function CriminalDBPage() {
             }
         } catch {
             setCriminals([]);
-            setError('Cannot reach API server at http://localhost:3001. Start/restart backend and refresh.');
+            setError(`Cannot reach API server at ${getApiBaseUrl()}. Start/restart backend and refresh.`);
         } finally {
             setIsLoading(false);
         }
@@ -103,9 +101,7 @@ export default function CriminalDBPage() {
 
     const fetchRecStatus = async () => {
         try {
-            const res = await fetch(`${API}/api/cctv/recognition-status`, {
-                headers: { Authorization: `Bearer ${token}` },
-            });
+            const res = await authFetch(`${getApiBaseUrl()}/api/cctv/recognition-status`, {}, token);
             if (res.ok) {
                 const data = await res.json();
                 setRecStatus(data);
@@ -185,11 +181,10 @@ export default function CriminalDBPage() {
             fd.append('notes', notes);
             fd.append('base64_samples', JSON.stringify(capturedSamples));
 
-            const res = await fetch(`${API}/api/cctv/register-criminal-samples?name=${encodeURIComponent(normalizedName)}`, {
+            const res = await authFetch(`${getApiBaseUrl()}/api/cctv/register-criminal-samples?name=${encodeURIComponent(normalizedName)}`, {
                 method: 'POST',
-                headers: { Authorization: `Bearer ${token}` },
                 body: fd,
-            });
+            }, token);
 
             const data = await res.json();
             if (!res.ok) {
@@ -232,11 +227,10 @@ export default function CriminalDBPage() {
                 fd.append('samples', f);
             }
 
-            const res = await fetch(`${API}/api/cctv/register-criminal-samples?name=${encodeURIComponent(name.trim())}`, {
+            const res = await authFetch(`${getApiBaseUrl()}/api/cctv/register-criminal-samples?name=${encodeURIComponent(name.trim())}`, {
                 method: 'POST',
-                headers: { Authorization: `Bearer ${token}` },
                 body: fd,
-            });
+            }, token);
 
             const data = await res.json();
             if (!res.ok) {
@@ -260,10 +254,7 @@ export default function CriminalDBPage() {
 
     const handleDeleteCriminal = async (criminalId: string) => {
         try {
-            const res = await fetch(`${API}/api/cctv/criminal-db/${criminalId}`, {
-                method: 'DELETE',
-                headers: { Authorization: `Bearer ${token}` },
-            });
+            const res = await authFetch(`${getApiBaseUrl()}/api/cctv/criminal-db/${criminalId}`, { method: 'DELETE' }, token);
             if (res.ok) {
                 setCriminals(prev => prev.filter(c => c.id !== criminalId));
             }
@@ -278,9 +269,7 @@ export default function CriminalDBPage() {
         setAddSampleFiles([]);
         setLoadingSamples(true);
         try {
-            const res = await fetch(`${API}/api/cctv/criminal-db/${criminal.id}/samples`, {
-                headers: { Authorization: `Bearer ${token}` },
-            });
+            const res = await authFetch(`${getApiBaseUrl()}/api/cctv/criminal-db/${criminal.id}/samples`, {}, token);
             const data = await res.json().catch(() => ({}));
             if (res.ok) setSelectedSamples(Array.isArray(data.samples) ? data.samples : []);
         } catch {
@@ -297,11 +286,10 @@ export default function CriminalDBPage() {
         try {
             const fd = new FormData();
             for (const f of addSampleFiles) fd.append('samples', f);
-            const res = await fetch(`${API}/api/cctv/criminal-db/${selectedCriminal.id}/add-samples`, {
+            const res = await authFetch(`${getApiBaseUrl()}/api/cctv/criminal-db/${selectedCriminal.id}/add-samples`, {
                 method: 'POST',
-                headers: { Authorization: `Bearer ${token}` },
                 body: fd,
-            });
+            }, token);
             const data = await res.json().catch(() => ({}));
             if (!res.ok) {
                 setError(data.error || 'Failed to add images.');
@@ -333,7 +321,7 @@ export default function CriminalDBPage() {
                     <div className="flex gap-3 items-center">
                         {recStatus && (
                             <div className={`text-xs px-3 py-1.5 rounded-full border font-mono ${recStatus.model_trained ? 'bg-green-500/10 text-green-400 border-green-500/20' : 'bg-amber-500/10 text-amber-400 border-amber-500/20'}`}>
-                                {recStatus.model_trained ? `Model Active · ${recStatus.total_subjects} subjects` : 'Model Not Trained'}
+                                {recStatus.model_trained ? `Identity Pipeline Active · ${recStatus.total_subjects} subjects` : 'Identity Pipeline Not Ready'}
                             </div>
                         )}
                         <button
@@ -349,7 +337,7 @@ export default function CriminalDBPage() {
                 {/* Success toast */}
                 {success && (
                     <div className="mb-6 bg-green-500/10 border border-green-500/20 text-green-400 px-4 py-3 rounded-xl text-sm flex items-center gap-2">
-                        <CheckCircle className="w-4 h-4" /> Criminal registered successfully. LBPH model retrained.
+                        <CheckCircle className="w-4 h-4" /> Criminal registered successfully. Identity galleries refreshed.
                     </div>
                 )}
 

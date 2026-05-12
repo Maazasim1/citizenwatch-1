@@ -6,8 +6,8 @@ import Link from 'next/link';
 import Navbar from '../../components/Navbar';
 import { useAuth } from '../../context/AuthContext';
 import { useRouter } from 'next/navigation';
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL || 'http://localhost:3001';
 import { useEffect } from 'react';
+import { getApiBaseUrl } from '@/lib/apiBase';
 
 const crimeTypes = [
     'ARMED_ROBBERY',
@@ -71,7 +71,7 @@ export default function ReportPage() {
                 fd.append('media', f);
             }
 
-            const res = await fetch(`${API_BASE}/api/reports/anonymous`, {
+            const res = await fetch(`${getApiBaseUrl()}/api/reports/anonymous`, {
                 method: 'POST',
                 body: fd,
             });

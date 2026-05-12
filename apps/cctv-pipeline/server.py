@@ -1,7 +1,7 @@
 """
 CCTV Pipeline — Flask REST API Server
 Exposes YOLOv8 person detection, face detection, criminal DB matching,
-and LBPH-based real-time face recognition to the Node.js backend via HTTP.
+ArcFace face recognition, and OSNet ReID fallback to the Node.js backend via HTTP.
 
 Run: python server.py
 Listens on port 3600 by default.
@@ -14,6 +14,15 @@ import tempfile
 import json
 import socket
 import numpy as np
+
+# Use the OS trust store so corporate proxies / Windows certs don't break model downloads.
+try:
+    import truststore as _truststore  # type: ignore
+    _truststore.inject_into_ssl()
+    print("[CCTV Pipeline] Using OS trust store for SSL.")
+except Exception as _ts_exc:  # pragma: no cover
+    print(f"[CCTV Pipeline] truststore unavailable ({_ts_exc}); falling back to default certs.")
+
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 
@@ -28,6 +37,7 @@ from face_engine import (
     remove_criminal_by_name,
     sync_subjects_with_names,
     register_criminal_samples,
+    extract_identity_embeddings_from_image,
     recognize_faces_in_frame,
     train_model,
     get_recognition_status,
@@ -222,6 +232,29 @@ def match_face_endpoint():
     })
 
 
+@app.route("/extract-identity", methods=["POST"])
+def extract_identity_endpoint():
+    """
+    Upload an image and return probe face/ReID embeddings for pgvector search.
+    Matching is intentionally left to the Node/Postgres layer.
+    """
+    if "file" not in request.files:
+        return jsonify({"error": "No file uploaded"}), 400
+
+    file = request.files["file"]
+    ext = os.path.splitext(file.filename or "")[1].lower()
+    unique_name = f"{uuid.uuid4()}{ext}"
+    saved_path = os.path.join(UPLOAD_DIR, unique_name)
+    file.save(saved_path)
+
+    embeddings = extract_identity_embeddings_from_image(saved_path)
+    return jsonify({
+        "filename": file.filename,
+        "identity_embeddings": embeddings,
+        "embedding_count": len(embeddings),
+    })
+
+
 # ── Criminal Database Management (Feature 3) ───────────────────────
 
 @app.route("/criminal-db", methods=["GET"])
@@ -383,6 +416,8 @@ def register_samples_endpoint():
     result = register_criminal_samples(name, images, fir_number, append=append)
     if result is None:
         return jsonify({"error": "Registration failed — too few images contained detectable faces"}), 400
+    if isinstance(result, dict) and result.get("error"):
+        return jsonify({"success": False, **result}), 400
 
     return jsonify({"success": True, "registration": result})
 
@@ -455,7 +490,7 @@ def recognize_frame_endpoint():
 
 @app.route("/train", methods=["POST"])
 def train_endpoint():
-    """Force re-train the LBPH model from current face_samples/."""
+    """Force refresh of identity galleries from current samples."""
     model, names = train_model()
     if model is None:
         return jsonify({"success": False, "message": "No training data available"}), 400
@@ -485,9 +520,33 @@ def sync_subjects_endpoint():
 
 
 if __name__ == "__main__":
-    # Pre-train model on startup if samples exist
-    print("[CCTV Pipeline] Pre-training LBPH model...")
+    # Eagerly load identity backends so we see CUDA/CPU provider logs on startup.
+    print("[CCTV Pipeline] Warming identity backends...")
+    try:
+        from identity_models import get_identity_backend_status
+        warm_status = get_identity_backend_status(load=True)
+        print(f"[CCTV Pipeline] Backend status: {warm_status}")
+    except Exception as exc:
+        print(f"[CCTV Pipeline] Backend warm-up failed: {exc}")
+
+    # Eagerly load YOLOv8 (warms model + prints chosen device).
+    try:
+        from detector import get_model as _get_yolo
+        _get_yolo()
+    except Exception as exc:
+        print(f"[CCTV Pipeline] YOLO warm-up failed: {exc}")
+
+    # Pre-train identity galleries on startup if samples exist.
+    print("[CCTV Pipeline] Pre-training identity models...")
     train_model()
+
+    # Start the binary WebSocket server in a daemon thread for low-latency streaming.
+    if os.environ.get("CCTV_DISABLE_WS", "0").lower() not in {"1", "true", "yes", "on"}:
+        try:
+            from ws_server import start_in_background as _start_ws
+            _start_ws()
+        except Exception as exc:
+            print(f"[CCTV Pipeline] WebSocket server failed to start: {exc}")
 
     host = os.environ.get("CCTV_HOST", "127.0.0.1")
     port = int(os.environ.get("CCTV_PORT", 3600))
@@ -520,10 +579,21 @@ if __name__ == "__main__":
         s.close()
         print(f"[CCTV Pipeline] Falling back to OS-assigned port {selected_port}.")
 
-    app.run(
-        host=host,
-        port=selected_port,
-        debug=debug_mode,
-        # Disable Flask reloader by default to avoid duplicate bind races on Windows.
-        use_reloader=False,
-    )
+    use_waitress = os.environ.get("CCTV_USE_WAITRESS", "1").lower() in {"1", "true", "yes", "on"} and not debug_mode
+    if use_waitress:
+        try:
+            from waitress import serve
+            threads = int(os.environ.get("CCTV_WAITRESS_THREADS", "8"))
+            print(f"[CCTV Pipeline] Serving with waitress on {host}:{selected_port} (threads={threads})")
+            serve(app, host=host, port=selected_port, threads=threads, channel_timeout=120)
+        except Exception as exc:
+            print(f"[CCTV Pipeline] Waitress unavailable ({exc}); falling back to Flask dev server.")
+            app.run(host=host, port=selected_port, debug=debug_mode, use_reloader=False)
+    else:
+        app.run(
+            host=host,
+            port=selected_port,
+            debug=debug_mode,
+            # Disable Flask reloader by default to avoid duplicate bind races on Windows.
+            use_reloader=False,
+        )

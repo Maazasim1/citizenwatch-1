@@ -6,7 +6,8 @@ import Link from 'next/link';
 import { useAuth } from '../context/AuthContext';
 import { useRouter } from 'next/navigation';
 import CriminalMatchAlert from './CriminalMatchAlert';
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL || 'http://localhost:3001';
+import { getApiBaseUrl } from '@/lib/apiBase';
+import { authFetch } from '@/lib/authFetch';
 
 const roleBadge: Record<string, { label: string; className: string }> = {
     CITIZEN: { label: 'Citizen', className: 'bg-blue-500/10 text-blue-400 border-blue-500/20' },
@@ -28,10 +29,11 @@ export default function Navbar() {
         const controller = new AbortController();
         const fetchNotifs = async () => {
             try {
-                const res = await fetch(`${API_BASE}/api/notifications`, {
-                    headers: { Authorization: `Bearer ${token}` },
-                    signal: controller.signal,
-                });
+                const res = await authFetch(
+                    `${getApiBaseUrl()}/api/notifications`,
+                    { signal: controller.signal },
+                    token,
+                );
                 if (!res.ok) return;
                 const data = await res.json();
                 if (data.notifications) setNotifications(data.notifications);
@@ -51,30 +53,21 @@ export default function Navbar() {
 
     const markAsRead = async (id: string) => {
         try {
-            await fetch(`${API_BASE}/api/notifications/${id}/read`, {
-                method: 'POST',
-                headers: { Authorization: `Bearer ${token}` }
-            });
+            await authFetch(`${getApiBaseUrl()}/api/notifications/${id}/read`, { method: 'POST' }, token);
             setNotifications(prev => prev.map(n => n.id === id ? { ...n, isRead: true } : n));
         } catch {}
     };
 
     const deleteNotification = async (id: string) => {
         try {
-            await fetch(`${API_BASE}/api/notifications/${id}`, {
-                method: 'DELETE',
-                headers: { Authorization: `Bearer ${token}` }
-            });
+            await authFetch(`${getApiBaseUrl()}/api/notifications/${id}`, { method: 'DELETE' }, token);
             setNotifications(prev => prev.filter(n => n.id !== id));
         } catch {}
     };
 
     const clearNotifications = async () => {
         try {
-            await fetch(`${API_BASE}/api/notifications`, {
-                method: 'DELETE',
-                headers: { Authorization: `Bearer ${token}` }
-            });
+            await authFetch(`${getApiBaseUrl()}/api/notifications`, { method: 'DELETE' }, token);
             setNotifications([]);
             setShowNotifs(false);
         } catch {}

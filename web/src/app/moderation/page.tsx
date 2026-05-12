@@ -5,7 +5,8 @@ import { ShieldAlert, CheckCircle, XCircle, AlertOctagon, Clock, Eye } from 'luc
 import Link from 'next/link';
 import Navbar from '../../components/Navbar';
 import { useAuth } from '../../context/AuthContext';
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL || 'http://localhost:3001';
+import { getApiBaseUrl } from '@/lib/apiBase';
+import { authFetch } from '@/lib/authFetch';
 
 interface Report {
     id: string;
@@ -71,11 +72,7 @@ export default function ModerationPage() {
             return;
         }
 
-        fetch(`${API_BASE}/api/reports/queue?lowConfidenceThreshold=${LOW_CONFIDENCE_THRESHOLD}`, {
-            headers: {
-                Authorization: `Bearer ${token}`,
-            },
-        })
+        authFetch(`${getApiBaseUrl()}/api/reports/queue?lowConfidenceThreshold=${LOW_CONFIDENCE_THRESHOLD}`, {}, token)
             .then((res) => res.json())
             .then((data) => { setReports(data.reports || []); setLoading(false); })
             .catch(() => setLoading(false));
@@ -91,9 +88,7 @@ export default function ModerationPage() {
         if (!token || !selected || !canModerate) return;
         setVoteLogLoading(true);
         try {
-            const res = await fetch(`${API_BASE}/api/reports/${selected.id}/votes`, {
-                headers: { Authorization: `Bearer ${token}` },
-            });
+            const res = await authFetch(`${getApiBaseUrl()}/api/reports/${selected.id}/votes`, {}, token);
             const data = await res.json().catch(() => ({}));
             if (!res.ok) throw new Error(data.error || 'Failed to load votes');
             setVoteLog(Array.isArray(data.votes) ? data.votes : []);
@@ -120,14 +115,11 @@ export default function ModerationPage() {
             }
 
             setSubmitting(true);
-            const res = await fetch(`${API_BASE}/api/reports/${reportId}/moderate`, {
+            const res = await authFetch(`${getApiBaseUrl()}/api/reports/${reportId}/moderate`, {
                 method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    Authorization: `Bearer ${token}`,
-                },
+                headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ status: action, reason: trimmed }),
-            });
+            }, token);
 
             if (!res.ok) {
                 const data = await res.json().catch(() => ({}));

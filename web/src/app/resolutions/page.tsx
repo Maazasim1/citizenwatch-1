@@ -4,8 +4,9 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import Navbar from '../../components/Navbar';
 import { useAuth } from '../../context/AuthContext';
 import { useRouter } from 'next/navigation';
+import { getApiBaseUrl } from '@/lib/apiBase';
+import { authFetch } from '@/lib/authFetch';
 
-const API = process.env.NEXT_PUBLIC_API_BASE_URL || 'http://localhost:3001';
 type TF = '24h' | '7d' | '30d' | 'all';
 type ReportFeedRow = {
     id: string;
@@ -77,9 +78,7 @@ export default function ResolutionsPage() {
         setMsg('');
         try {
             const params = new URLSearchParams({ timeFilter, page: String(page) });
-            const res = await fetch(`${API}/api/reports/resolutions-dashboard?${params.toString()}`, {
-                headers: { Authorization: `Bearer ${token}` },
-            });
+            const res = await authFetch(`${getApiBaseUrl()}/api/reports/resolutions-dashboard?${params.toString()}`, {}, token);
             const d = (await res.json().catch(() => ({}))) as Partial<DashboardData> & { error?: string };
             if (!res.ok) throw new Error(d.error || 'Failed to load dashboard');
             setData(d as DashboardData);
@@ -100,14 +99,11 @@ export default function ResolutionsPage() {
         setBusyId(id);
         setMsg('');
         try {
-            const res = await fetch(`${API}/api/reports/${id}/reopen`, {
+            const res = await authFetch(`${getApiBaseUrl()}/api/reports/${id}/reopen`, {
                 method: 'POST',
-                headers: {
-                    Authorization: `Bearer ${token}`,
-                    'Content-Type': 'application/json',
-                },
+                headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ notes: notes.slice(0, 500) }),
-            });
+            }, token);
             const d = (await res.json().catch(() => ({}))) as { error?: string };
             if (!res.ok) throw new Error(d.error || 'Reopen failed');
             setMsg('Report reopened.');

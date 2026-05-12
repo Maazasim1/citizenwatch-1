@@ -1,13 +1,14 @@
 'use client';
 
 import { useState, useEffect, useRef, useCallback } from 'react';
+import { io as ioClient, Socket } from 'socket.io-client';
 import Navbar from '../../components/Navbar';
 import { useAuth } from '../../context/AuthContext';
 import { Camera, Upload, AlertCircle, User, LocateFixed, Radio, VideoOff, Scan, ShieldAlert } from 'lucide-react';
 import { useRouter } from 'next/navigation';
 import Link from 'next/link';
-
-const API = process.env.NEXT_PUBLIC_API_BASE_URL || 'http://localhost:3001';
+import { getApiBaseUrl } from '@/lib/apiBase';
+import { authFetch, isSocketAuthErrorMessage, notifySessionInvalid } from '@/lib/authFetch';
 
 interface RecognizedFace {
     name: string;
@@ -39,6 +40,74 @@ export default function CCTVDashboard() {
     const cameraLocationRef = useRef<{ lat: number; lng: number } | null>(null);
     const streamHealthTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+    // ── WebSocket frame channel ──
+    const cctvSocketRef = useRef<Socket | null>(null);
+    const [wsConnected, setWsConnected] = useState(false);
+    const inFlightRef = useRef(false);
+    const isStreamingRef = useRef(false);
+    const annotatedUrlRef = useRef<string | null>(null);
+    const [latencyMs, setLatencyMs] = useState<number | null>(null);
+    const [pipelineMs, setPipelineMs] = useState<number | null>(null);
+
+    // ── Multi-camera identity ──
+    const [cameraName, setCameraName] = useState<string>('');
+    const [cameraId, setCameraId] = useState<string>('');
+    useEffect(() => {
+        if (typeof window === 'undefined') return;
+        let id = window.localStorage.getItem('cctv.cameraId');
+        if (!id) {
+            id = `cam-${Math.random().toString(36).slice(2, 10)}`;
+            window.localStorage.setItem('cctv.cameraId', id);
+        }
+        setCameraId(id);
+        const name = window.localStorage.getItem('cctv.cameraName') || `Camera ${id.slice(4, 8).toUpperCase()}`;
+        setCameraName(name);
+    }, []);
+    const updateCameraName = useCallback((name: string) => {
+        setCameraName(name);
+        if (typeof window !== 'undefined') {
+            window.localStorage.setItem('cctv.cameraName', name);
+        }
+    }, []);
+
+    // ── Webcam device picker ──
+    const [videoDevices, setVideoDevices] = useState<MediaDeviceInfo[]>([]);
+    const [selectedDeviceId, setSelectedDeviceId] = useState<string>('');
+
+    const refreshVideoDevices = useCallback(async () => {
+        if (typeof navigator === 'undefined' || !navigator.mediaDevices?.enumerateDevices) return;
+        try {
+            const devices = await navigator.mediaDevices.enumerateDevices();
+            const cams = devices.filter((d) => d.kind === 'videoinput');
+            setVideoDevices(cams);
+            // If the currently-selected id is gone (camera unplugged), fall back.
+            setSelectedDeviceId((prev) => {
+                if (prev && cams.some((c) => c.deviceId === prev)) return prev;
+                const stored = window.localStorage.getItem('cctv.deviceId') || '';
+                if (stored && cams.some((c) => c.deviceId === stored)) return stored;
+                return cams[0]?.deviceId || '';
+            });
+        } catch (err) {
+            console.warn('[cctv] enumerateDevices failed', err);
+        }
+    }, []);
+
+    useEffect(() => {
+        if (typeof navigator === 'undefined' || !navigator.mediaDevices) return;
+        refreshVideoDevices();
+        navigator.mediaDevices.addEventListener?.('devicechange', refreshVideoDevices);
+        return () => {
+            navigator.mediaDevices.removeEventListener?.('devicechange', refreshVideoDevices);
+        };
+    }, [refreshVideoDevices]);
+
+    const updateSelectedDevice = useCallback((deviceId: string) => {
+        setSelectedDeviceId(deviceId);
+        if (typeof window !== 'undefined') {
+            window.localStorage.setItem('cctv.deviceId', deviceId);
+        }
+    }, []);
+
     // ── File upload state (existing) ──
     const [file, setFile] = useState<File | null>(null);
     const [preview, setPreview] = useState<string | null>(null);
@@ -55,12 +124,40 @@ export default function CCTVDashboard() {
     // Fetch recognition status
     useEffect(() => {
         if (!token) return;
-        fetch(`${API}/api/cctv/recognition-status`, {
-            headers: { Authorization: `Bearer ${token}` },
-        })
+        authFetch(`${getApiBaseUrl()}/api/cctv/recognition-status`, {}, token)
             .then(r => r.json())
             .then(data => setRecognitionStatus(data))
             .catch(() => {});
+    }, [token]);
+
+    // Open / close the CCTV stream WebSocket alongside the auth token lifecycle.
+    useEffect(() => {
+        if (!token) return;
+        const socket = ioClient(`${getApiBaseUrl()}/cctv-stream`, {
+            auth: { token },
+            transports: ['websocket'],
+            reconnection: true,
+            reconnectionDelay: 1000,
+        });
+        cctvSocketRef.current = socket;
+
+        socket.on('connect', () => setWsConnected(true));
+        socket.on('disconnect', () => setWsConnected(false));
+        socket.on('connect_error', (err) => {
+            const msg = err?.message || '';
+            if (token && isSocketAuthErrorMessage(msg)) {
+                notifySessionInvalid();
+                return;
+            }
+            setLiveError(`Stream socket: ${err.message}`);
+            setWsConnected(false);
+        });
+
+        return () => {
+            socket.disconnect();
+            cctvSocketRef.current = null;
+            setWsConnected(false);
+        };
     }, [token]);
 
     // Cleanup on unmount
@@ -73,16 +170,34 @@ export default function CCTVDashboard() {
     const startStream = useCallback(async () => {
         setLiveError('');
         try {
+            const baseVideo: MediaTrackConstraints = { width: 640, height: 480 };
+            const wantedDeviceId = selectedDeviceId
+                || (typeof window !== 'undefined' ? window.localStorage.getItem('cctv.deviceId') : '')
+                || '';
+
             let stream: MediaStream;
             try {
                 stream = await navigator.mediaDevices.getUserMedia({
-                    video: { width: 640, height: 480, facingMode: 'user' },
+                    video: wantedDeviceId
+                        ? { ...baseVideo, deviceId: { exact: wantedDeviceId } }
+                        : { ...baseVideo, facingMode: 'user' },
                 });
-            } catch {
-                // Fallback: try without specific constraints
+            } catch (primaryErr) {
+                // Fallback: requested device unavailable / over-constrained — try any camera.
+                console.warn('[cctv] primary getUserMedia failed, falling back', primaryErr);
                 stream = await navigator.mediaDevices.getUserMedia({ video: true });
             }
             streamRef.current = stream;
+
+            // Labels are only populated after a permission grant; re-enumerate so the
+            // dropdown shows real names ("Logitech BRIO", "OBS Virtual Camera", …).
+            refreshVideoDevices();
+
+            // Reflect what we actually got into the picker selection.
+            const trackSettings = stream.getVideoTracks()[0]?.getSettings?.();
+            if (trackSettings?.deviceId) {
+                updateSelectedDevice(trackSettings.deviceId);
+            }
             if (videoRef.current) {
                 videoRef.current.srcObject = stream;
                 await videoRef.current.play();
@@ -127,16 +242,16 @@ export default function CCTVDashboard() {
                 setCameraLocation(null);
             }
 
-            // Start sending frames for recognition
-            intervalRef.current = setInterval(() => {
-                captureAndRecognize();
-            }, 800); // ~1.25fps to not overload
+            // Backpressured WS streaming: send next frame as soon as the previous result returns.
+            isStreamingRef.current = true;
+            sendNextFrame();
         } catch (err: any) {
             setLiveError(err?.message || 'Failed to access webcam. Please allow camera permissions.');
         }
     }, [token]);
 
     const stopStream = useCallback(() => {
+        isStreamingRef.current = false;
         if (intervalRef.current) {
             clearInterval(intervalRef.current);
             intervalRef.current = null;
@@ -152,57 +267,112 @@ export default function CCTVDashboard() {
         if (videoRef.current) {
             videoRef.current.srcObject = null;
         }
+        if (annotatedUrlRef.current) {
+            URL.revokeObjectURL(annotatedUrlRef.current);
+            annotatedUrlRef.current = null;
+        }
         setIsStreaming(false);
         setAnnotatedFrame(null);
+        inFlightRef.current = false;
     }, []);
 
-    const captureAndRecognize = useCallback(async () => {
-        if (!videoRef.current || !canvasRef.current || !token) return;
+    const sendNextFrame = useCallback(async () => {
+        if (!isStreamingRef.current) return;
+        if (inFlightRef.current) return;
+        const socket = cctvSocketRef.current;
+        if (!socket || !socket.connected) {
+            // Retry shortly while the socket comes up.
+            setTimeout(sendNextFrame, 100);
+            return;
+        }
+        if (!videoRef.current || !canvasRef.current) return;
 
         const video = videoRef.current;
         const canvas = canvasRef.current;
-        canvas.width = video.videoWidth || 640;
-        canvas.height = video.videoHeight || 480;
+        if (!video.videoWidth || !video.videoHeight) {
+            setTimeout(sendNextFrame, 50);
+            return;
+        }
+
+        // Keep frame size bounded so pipeline inference latency stays stable.
+        // Some webcams ignore requested constraints and deliver very large frames.
+        const maxW = 640;
+        const maxH = 360;
+        const srcW = video.videoWidth;
+        const srcH = video.videoHeight;
+        const scale = Math.min(maxW / srcW, maxH / srcH, 1);
+        canvas.width = Math.max(1, Math.round(srcW * scale));
+        canvas.height = Math.max(1, Math.round(srcH * scale));
         const ctx = canvas.getContext('2d');
         if (!ctx) return;
         ctx.drawImage(video, 0, 0);
 
-        const frame_base64 = canvas.toDataURL('image/jpeg', 0.7);
+        const blob: Blob | null = await new Promise((resolve) =>
+            canvas.toBlob(resolve, 'image/jpeg', 0.7),
+        );
+        if (!blob) return;
 
-        try {
-            const res = await fetch(`${API}/api/cctv/recognize-frame`, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    Authorization: `Bearer ${token}`,
-                },
-                body: JSON.stringify({
-                    frame_base64,
-                    camera_latitude: cameraLocationRef.current?.lat ?? null,
-                    camera_longitude: cameraLocationRef.current?.lng ?? null,
-                }),
-            });
+        const arrayBuffer = await blob.arrayBuffer();
+        inFlightRef.current = true;
+        const sentAt = performance.now();
 
-            if (res.ok) {
-                const data = await res.json();
-                setAnnotatedFrame(data.annotated_frame);
-                setDetectedFaces(data.faces || []);
-                setFrameCount(prev => prev + 1);
+        const ackGuard = setTimeout(() => {
+            if (!isStreamingRef.current) return;
+            inFlightRef.current = false;
+            setLiveError('Live frame processing is slow. Retrying with reduced frame size...');
+            requestAnimationFrame(() => sendNextFrame());
+        }, 20000);
 
-                // Add new matches to history
-                const newMatches = (data.matches || []) as RecognizedFace[];
-                if (newMatches.length > 0) {
-                    const now = new Date().toLocaleTimeString();
-                    setMatchHistory(prev => [
-                        ...newMatches.map(m => ({ ...m, timestamp: now })),
-                        ...prev,
-                    ].slice(0, 50));
+        socket.emit(
+            'cctv:frame',
+            {
+                jpeg: arrayBuffer,
+                camera_id: cameraId || undefined,
+                camera_name: cameraName || undefined,
+                camera_latitude: cameraLocationRef.current?.lat ?? null,
+                camera_longitude: cameraLocationRef.current?.lng ?? null,
+            },
+            (response: any) => {
+                clearTimeout(ackGuard);
+                inFlightRef.current = false;
+                const rtt = performance.now() - sentAt;
+                setLatencyMs(Math.round(rtt));
+
+                if (!response || response.error) {
+                    if (response?.error) console.warn('[cctv-stream] error:', response.error);
+                } else {
+                    const meta = response.meta || {};
+                    setPipelineMs(typeof meta.pipeline_elapsed_ms === 'number' ? meta.pipeline_elapsed_ms : null);
+                    setDetectedFaces(meta.faces || []);
+                    setFrameCount((prev) => prev + 1);
+
+                    const annotatedJpeg: ArrayBuffer | null = response.jpeg || null;
+                    if (annotatedJpeg && annotatedJpeg.byteLength > 0) {
+                        const annotatedBlob = new Blob([annotatedJpeg], { type: 'image/jpeg' });
+                        const url = URL.createObjectURL(annotatedBlob);
+                        if (annotatedUrlRef.current) {
+                            URL.revokeObjectURL(annotatedUrlRef.current);
+                        }
+                        annotatedUrlRef.current = url;
+                        setAnnotatedFrame(url);
+                    }
+
+                    const newMatches = (meta.matches || []) as RecognizedFace[];
+                    if (newMatches.length > 0) {
+                        const now = new Date().toLocaleTimeString();
+                        setMatchHistory((prev) =>
+                            [...newMatches.map((m) => ({ ...m, timestamp: now })), ...prev].slice(0, 50),
+                        );
+                    }
                 }
-            }
-        } catch {
-            // Silently handle frame errors to not spam the UI
-        }
-    }, [token]);
+
+                // Immediately request the next frame for end-to-end backpressure.
+                if (isStreamingRef.current) {
+                    requestAnimationFrame(() => sendNextFrame());
+                }
+            },
+        );
+    }, [cameraId, cameraName]);
 
     // ── File upload handlers (existing) ──
     const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -227,11 +397,10 @@ export default function CCTVDashboard() {
             const fd = new FormData();
             fd.append('file', file);
 
-            const res = await fetch(`${API}/api/cctv/upload`, {
+            const res = await authFetch(`${getApiBaseUrl()}/api/cctv/upload`, {
                 method: 'POST',
-                headers: { Authorization: `Bearer ${token}` },
                 body: fd,
-            });
+            }, token);
 
             const data = await res.json();
             if (!res.ok) {
@@ -273,9 +442,14 @@ export default function CCTVDashboard() {
                             </h1>
                             <p className="text-sm text-slate-400 mt-1">Real-time face detection & criminal identification</p>
                         </div>
-                        <Link href="/cctv/criminals" className="bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 px-4 py-2 rounded-xl text-xs font-semibold transition-all flex items-center gap-2">
-                            <User className="w-3.5 h-3.5" /> Criminal DB
-                        </Link>
+                        <div className="flex items-center gap-2">
+                            <Link href="/cctv/dashboard" className="bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 px-4 py-2 rounded-xl text-xs font-semibold transition-all flex items-center gap-2">
+                                <Scan className="w-3.5 h-3.5" /> Camera Grid
+                            </Link>
+                            <Link href="/cctv/criminals" className="bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 px-4 py-2 rounded-xl text-xs font-semibold transition-all flex items-center gap-2">
+                                <User className="w-3.5 h-3.5" /> Criminal DB
+                            </Link>
+                        </div>
                     </div>
 
                     {/* Mode Tabs */}
@@ -347,7 +521,52 @@ export default function CCTVDashboard() {
                             </div>
 
                             {/* Live controls */}
-                            <div className="mt-4 flex gap-3 items-center">
+                            <div className="mt-4 flex flex-col sm:flex-row gap-3 sm:items-center flex-wrap">
+                                <div className="flex items-center gap-2">
+                                    <label className="text-xs text-slate-400 uppercase tracking-wide">Camera</label>
+                                    <input
+                                        value={cameraName}
+                                        onChange={(e) => updateCameraName(e.target.value)}
+                                        placeholder="Camera name"
+                                        className="bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-100 placeholder-slate-500 focus:outline-none focus:border-indigo-500 min-w-[180px]"
+                                        disabled={isStreaming}
+                                    />
+                                    <span className="text-[10px] font-mono text-slate-500" title="Stable camera id">{cameraId.slice(0, 10)}</span>
+                                </div>
+
+                                <div className="flex items-center gap-2">
+                                    <label className="text-xs text-slate-400 uppercase tracking-wide">Webcam</label>
+                                    <select
+                                        value={selectedDeviceId}
+                                        onChange={(e) => {
+                                            const id = e.target.value;
+                                            updateSelectedDevice(id);
+                                            // If currently streaming, hot-swap to the chosen device.
+                                            if (isStreaming) {
+                                                stopStream();
+                                                setTimeout(() => startStream(), 50);
+                                            }
+                                        }}
+                                        className="bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-100 focus:outline-none focus:border-indigo-500 min-w-[220px] max-w-[320px]"
+                                    >
+                                        {videoDevices.length === 0 && (
+                                            <option value="">No webcams detected</option>
+                                        )}
+                                        {videoDevices.map((d, i) => (
+                                            <option key={d.deviceId || i} value={d.deviceId}>
+                                                {d.label || `Camera ${i + 1}`}
+                                            </option>
+                                        ))}
+                                    </select>
+                                    <button
+                                        type="button"
+                                        onClick={refreshVideoDevices}
+                                        title="Refresh device list"
+                                        className="text-xs text-slate-400 hover:text-slate-200 px-2 py-1 rounded border border-slate-700 hover:border-slate-500"
+                                    >
+                                        ↻
+                                    </button>
+                                </div>
                                 <button
                                     onClick={isStreaming ? stopStream : startStream}
                                     className={`px-8 py-3 rounded-xl font-semibold text-sm transition-all shadow-lg flex items-center gap-2 ${
@@ -365,8 +584,16 @@ export default function CCTVDashboard() {
 
                                 {isStreaming && (
                                     <div className="flex items-center gap-2 text-xs text-slate-400">
-                                        <div className="w-2 h-2 rounded-full bg-green-500 animate-pulse" />
+                                        <div className={`w-2 h-2 rounded-full animate-pulse ${wsConnected ? 'bg-green-500' : 'bg-amber-500'}`} />
                                         Camera Active · {detectedFaces.length} face{detectedFaces.length !== 1 ? 's' : ''} detected
+                                        <span className={wsConnected ? 'text-emerald-400' : 'text-amber-400'}>
+                                            · {wsConnected ? 'WS' : 'WS reconnecting'}
+                                        </span>
+                                        {latencyMs != null && (
+                                            <span className="text-slate-500">
+                                                · {latencyMs} ms RTT{pipelineMs != null ? ` (pipeline ${pipelineMs} ms)` : ''}
+                                            </span>
+                                        )}
                                         {cameraLocation ? (
                                             <span className="text-emerald-400">· location attached</span>
                                         ) : (
@@ -495,7 +722,7 @@ export default function CCTVDashboard() {
                                 result.detections.map((det: any, idx: number) => (
                                     <div key={idx} className="bg-slate-950 border border-slate-800 rounded-xl overflow-hidden shadow-sm flex">
                                         <div className="w-24 h-24 bg-black flex-shrink-0 relative">
-                                            <img src={`${API}/cctv-detections/${det.personCrop}`} className="w-full h-full object-cover" alt="Crop" />
+                                            <img src={`${getApiBaseUrl()}/cctv-detections/${det.personCrop}`} className="w-full h-full object-cover" alt="Crop" />
                                             <div className="absolute top-1 left-1 bg-black/70 text-[10px] text-white px-1.5 py-0.5 rounded font-mono">
                                                 {(det.confidence * 100).toFixed(0)}%
                                             </div>

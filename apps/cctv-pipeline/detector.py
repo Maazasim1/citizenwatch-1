@@ -11,18 +11,81 @@ from pathlib import Path
 
 # Global model reference (lazy-loaded)
 _model = None
+_yolo_device = None
 
 DETECTIONS_DIR = os.path.join(os.path.dirname(__file__), "detections")
 os.makedirs(DETECTIONS_DIR, exist_ok=True)
 
 
+def _resolve_yolo_device():
+    """Pick GPU device when available, allow override via YOLO_DEVICE env."""
+    override = os.environ.get("YOLO_DEVICE")
+    if override:
+        return override
+    try:
+        import torch  # type: ignore
+        if torch.cuda.is_available():
+            return 0
+    except Exception:
+        pass
+    return "cpu"
+
+
 def get_model():
     """Lazy-load YOLOv8 model. Downloads yolov8n.pt on first run (~6MB)."""
-    global _model
+    global _model, _yolo_device
     if _model is None:
         from ultralytics import YOLO
-        _model = YOLO("yolov8n.pt")  # nano model for speed on CPU
+        _model = YOLO("yolov8n.pt")
+        _yolo_device = _resolve_yolo_device()
+        try:
+            _model.to(_yolo_device)
+        except Exception:
+            pass
+        print(f"[Detector] YOLOv8 ready device={_yolo_device}")
     return _model
+
+
+def _yolo_device_for_inference():
+    return _yolo_device if _yolo_device is not None else _resolve_yolo_device()
+
+
+def detect_person_boxes_in_frame(frame, confidence_threshold: float = 0.4):
+    """
+    Run YOLOv8 person detection on an in-memory frame.
+    Returns person boxes without writing crops to disk.
+    """
+    if frame is None or getattr(frame, "size", 0) == 0:
+        return []
+
+    model = get_model()
+    results = model(frame, verbose=False, device=_yolo_device_for_inference())
+    detections = []
+
+    for result in results:
+        boxes = result.boxes
+        if boxes is None:
+            continue
+
+        for box in boxes:
+            cls_id = int(box.cls[0])
+            conf = float(box.conf[0])
+            if cls_id != 0 or conf < confidence_threshold:
+                continue
+
+            x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+            h, w = frame.shape[:2]
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(w, x2), min(h, y2)
+            if x2 <= x1 or y2 <= y1:
+                continue
+
+            detections.append({
+                "confidence": round(conf, 4),
+                "bounding_box": {"x": x1, "y": y1, "w": x2 - x1, "h": y2 - y1},
+            })
+
+    return detections
 
 
 def detect_persons_in_image(image_path: str, confidence_threshold: float = 0.4):
@@ -35,7 +98,7 @@ def detect_persons_in_image(image_path: str, confidence_threshold: float = 0.4):
     if img is None:
         return {"error": f"Could not read image: {image_path}", "detections": []}
 
-    results = model(img, verbose=False)
+    results = model(img, verbose=False, device=_yolo_device_for_inference())
     detections = []
 
     for result in results:
@@ -105,7 +168,7 @@ def detect_persons_in_video(video_path: str, sample_every_n_frames: int = 30,
             break
 
         if frame_idx % sample_every_n_frames == 0:
-            results = model(frame, verbose=False)
+            results = model(frame, verbose=False, device=_yolo_device_for_inference())
 
             for result in results:
                 boxes = result.boxes

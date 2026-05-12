@@ -6,8 +6,8 @@ import Navbar from '../../../components/Navbar';
 import { useAuth } from '../../../context/AuthContext';
 import { useRouter } from 'next/navigation';
 import { CheckCircle2, Gavel, History, RefreshCw } from 'lucide-react';
-
-const API = process.env.NEXT_PUBLIC_API_BASE_URL || 'http://localhost:3001';
+import { getApiBaseUrl } from '@/lib/apiBase';
+import { authFetch } from '@/lib/authFetch';
 
 const RESOLUTION_TAGS = [
     { value: 'ARREST_MADE', label: 'Arrest made' },
@@ -63,9 +63,7 @@ export default function InspectorResolutionsPage() {
 
     const loadStats = useCallback(async () => {
         if (!token || !canAccess) return;
-        const res = await fetch(`${API}/api/reports/resolution-stats`, {
-            headers: { Authorization: `Bearer ${token}` },
-        });
+        const res = await authFetch(`${getApiBaseUrl()}/api/reports/resolution-stats`, {}, token);
         const data = await res.json().catch(() => ({}));
         if (res.ok) setStats(data);
     }, [token, canAccess]);
@@ -77,9 +75,7 @@ export default function InspectorResolutionsPage() {
             includeResolved: 'true',
             timeRange: 'all',
         });
-        const res = await fetch(`${API}/api/reports?${params}`, {
-            headers: { Authorization: `Bearer ${token}` },
-        });
+        const res = await authFetch(`${getApiBaseUrl()}/api/reports?${params}`, {}, token);
         const data = await res.json().catch(() => ({}));
         if (res.ok) setReports(Array.isArray(data.reports) ? data.reports : []);
     }, [token, canAccess]);
@@ -107,9 +103,7 @@ export default function InspectorResolutionsPage() {
         if (!token || !selected) return;
         let cancelled = false;
         (async () => {
-            const res = await fetch(`${API}/api/reports/${selected.id}/resolution-history`, {
-                headers: { Authorization: `Bearer ${token}` },
-            });
+            const res = await authFetch(`${getApiBaseUrl()}/api/reports/${selected.id}/resolution-history`, {}, token);
             const data = await res.json().catch(() => ({}));
             if (!cancelled && res.ok) setHistory(Array.isArray(data.history) ? data.history : []);
         })();
@@ -123,14 +117,11 @@ export default function InspectorResolutionsPage() {
         setBusy(true);
         setMsg('');
         try {
-            const res = await fetch(`${API}/api/reports/${selected.id}/resolve`, {
+            const res = await authFetch(`${getApiBaseUrl()}/api/reports/${selected.id}/resolve`, {
                 method: 'POST',
-                headers: {
-                    Authorization: `Bearer ${token}`,
-                    'Content-Type': 'application/json',
-                },
+                headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ tag, notes, confirmed }),
-            });
+            }, token);
             const data = await res.json().catch(() => ({}));
             if (!res.ok) throw new Error(data.error || 'Resolve failed');
             setMsg('Marked resolved.');
@@ -148,14 +139,11 @@ export default function InspectorResolutionsPage() {
         setBusy(true);
         setMsg('');
         try {
-            const res = await fetch(`${API}/api/reports/${selected.id}/reopen`, {
+            const res = await authFetch(`${getApiBaseUrl()}/api/reports/${selected.id}/reopen`, {
                 method: 'POST',
-                headers: {
-                    Authorization: `Bearer ${token}`,
-                    'Content-Type': 'application/json',
-                },
+                headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ notes: reopenNotes }),
-            });
+            }, token);
             const data = await res.json().catch(() => ({}));
             if (!res.ok) throw new Error(data.error || 'Reopen failed');
             setMsg('Reopened.');

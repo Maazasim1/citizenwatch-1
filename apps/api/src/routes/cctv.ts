@@ -5,14 +5,55 @@ import multer from 'multer';
 import fs from 'fs';
 import path from 'path';
 import { Readable } from 'stream';
+import {
+    IdentityEmbeddingPayload,
+    matchIdentityEmbeddings,
+    removeIdentityEmbeddings,
+    storeIdentityEmbeddings,
+    stripIdentityEmbeddings,
+} from '../services/identityEmbeddings';
 
 const router = Router();
 
 const CCTV_PIPELINE_URL = process.env.CCTV_PIPELINE_URL || 'http://localhost:3600';
 const DEBUG_RUN_ID = `criminal-db-${Date.now()}`;
-const LIVE_LBPH_THRESHOLD = 90;
 const LIVE_DEDUP_WINDOW_MS = 2 * 60 * 1000;
 const SAME_LOCATION_EPSILON = 0.0005; // ~55m at equator
+const ALERT_CONFIRM_HITS = Number(process.env.CCTV_ALERT_CONFIRM_HITS || 3);
+const ALERT_CONFIRM_WINDOW_MS = Number(process.env.CCTV_ALERT_CONFIRM_WINDOW_MS || 12000);
+const ALERT_CONFIRM_MIN_AVG_CONF = Number(process.env.CCTV_ALERT_CONFIRM_MIN_AVG_CONF || 0.72);
+
+type PendingLiveAlert = { hits: number; firstTs: number; sumConf: number };
+const pendingLiveAlerts = new Map<string, PendingLiveAlert>();
+
+function liveAlertAccumulatorKey(cameraId: string, trackId: string | number, criminalId: string) {
+    return `${cameraId}:${String(trackId)}:${criminalId}`;
+}
+
+/** Multi-frame confirmation for gated camera streams; returns true when alert should fire once. */
+function tryConfirmLiveAlert(
+    cameraId: string,
+    trackId: string | number | undefined,
+    criminalId: string,
+    conf: number,
+    alertEligible: boolean,
+): boolean {
+    if (!alertEligible || trackId == null || trackId === '') return false;
+    const key = liveAlertAccumulatorKey(cameraId, trackId, criminalId);
+    const now = Date.now();
+    let p = pendingLiveAlerts.get(key);
+    if (!p || now - p.firstTs > ALERT_CONFIRM_WINDOW_MS) {
+        p = { hits: 0, firstTs: now, sumConf: 0 };
+    }
+    p.hits += 1;
+    p.sumConf += conf;
+    pendingLiveAlerts.set(key, p);
+    if (p.hits >= ALERT_CONFIRM_HITS && p.sumConf / p.hits >= ALERT_CONFIRM_MIN_AVG_CONF) {
+        pendingLiveAlerts.delete(key);
+        return true;
+    }
+    return false;
+}
 const cctvCriminalDir = path.join(process.cwd(), '..', 'cctv-pipeline', 'criminal_db');
 const originalSamplesRoot = path.join(cctvCriminalDir, 'original_samples');
 const faceSamplesRoot = path.join(process.cwd(), '..', 'cctv-pipeline', 'face_samples');
@@ -22,8 +63,9 @@ const normalizeLiveConfidence = (value: unknown): number => {
     if (!Number.isFinite(n)) return 0;
     // If already in 0..1 range, keep it.
     if (n >= 0 && n <= 1) return n;
-    // LBPH distance (lower is better) to 0..1 confidence.
-    return Math.max(0, Math.min(1, (LIVE_LBPH_THRESHOLD - n) / 30));
+    // Legacy shape compatibility: treat 0..100 as percentage-like confidence.
+    if (n > 1 && n <= 100) return Math.max(0, Math.min(1, n / 100));
+    return 0;
 };
 
 const normalizeSubjectName = (name: string): string =>
@@ -32,6 +74,21 @@ const normalizeSubjectName = (name: string): string =>
         .toLowerCase()
         .replace(/[^a-z0-9 _-]/g, '')
         .replace(/\s+/g, '_');
+
+const queryIdentityEmbeddingsForFile = async (filePath: string): Promise<IdentityEmbeddingPayload[]> => {
+    const result = await forwardFileToPipeline(filePath, '/extract-identity');
+    return Array.isArray((result as any)?.identity_embeddings)
+        ? (result as any).identity_embeddings
+        : [];
+};
+
+const matchFileWithPgvector = async (
+    filePath: string,
+    threshold = 0.65,
+) => {
+    const embeddings = await queryIdentityEmbeddingsForFile(filePath);
+    return matchIdentityEmbeddings(embeddings, { faceThreshold: threshold });
+};
 
 const syncPipelineSubjectsWithDb = async () => {
     const current = await prisma.criminalRecord.findMany({
@@ -118,11 +175,29 @@ const saveLiveFrameSnapshot = async (frameBase64: string, req: Request): Promise
 
     try {
         const buffer = Buffer.from(payload, 'base64');
+        const baseUrl = `${req.protocol}://${req.get('host')}`;
+        return await persistLiveFrameSnapshot(buffer, ext, baseUrl);
+    } catch (e) {
+        console.warn('[CCTV] Failed to persist live frame snapshot', e);
+        return null;
+    }
+};
+
+/**
+ * Persist a JPEG/PNG snapshot to the live-match folder and return its public URL.
+ * Used by both the HTTP route and the WebSocket bridge.
+ */
+export const persistLiveFrameSnapshot = async (
+    buffer: Buffer,
+    ext: 'jpg' | 'png' = 'jpg',
+    baseUrl?: string,
+): Promise<string | null> => {
+    try {
         const filename = `live-match-${Date.now()}-${Math.random().toString(16).slice(2)}.${ext}`;
         const filePath = path.join(liveMatchSnapshotsDir, filename);
         await fs.promises.writeFile(filePath, buffer);
-        const baseUrl = `${req.protocol}://${req.get('host')}`;
-        return `${baseUrl}/uploads/cctv/matches/${filename}`;
+        const prefix = baseUrl || `http://localhost:${process.env.PORT || 3001}`;
+        return `${prefix}/uploads/cctv/matches/${filename}`;
     } catch (e) {
         console.warn('[CCTV] Failed to persist live frame snapshot', e);
         return null;
@@ -203,49 +278,32 @@ router.post('/upload', authenticate, requireRole('MODERATOR', 'LAW_ENFORCEMENT',
             try {
                 const cropPath = path.join(process.cwd(), '..', 'cctv-pipeline', 'detections', det.crop_filename);
                 if (fs.existsSync(cropPath)) {
-                    const FormDataMatch = await import('form-data');
-                    const FormDataMatchCls = FormDataMatch.default;
-                    const matchFormData = new FormDataMatchCls();
-                    matchFormData.append('file', fs.createReadStream(cropPath));
-                    matchFormData.append('threshold', '0.65');
+                    const matches = await matchFileWithPgvector(cropPath, 0.65);
+                    for (const m of matches) {
+                        const faceMatch = await prisma.faceMatch.create({
+                            data: {
+                                criminalId: m.criminalId,
+                                detectionId: record.id,
+                                detectionSource: 'CCTV',
+                                confidence: m.confidence,
+                                latitude,
+                                longitude,
+                            },
+                        });
 
-                    const matchResp = await fetch(`${CCTV_PIPELINE_URL}/match-face`, {
-                        method: 'POST',
-                        body: matchFormData as any,
-                        headers: matchFormData.getHeaders?.() ?? {},
-                    });
-
-                    if (matchResp.ok) {
-                        const matchResult = await matchResp.json() as any;
-                        for (const m of matchResult.matches || []) {
-                            const criminal = await prisma.criminalRecord.findFirst({
-                                where: { embeddingId: m.criminal_id },
+                        if (io) {
+                            io.emit('criminal:matched', {
+                                matchId: faceMatch.id,
+                                criminalName: m.name,
+                                firNumber: m.firNumber,
+                                confidence: m.confidence,
+                                latitude,
+                                longitude,
+                                source: 'CCTV',
+                                mugshotUrl: m.mugshotUrl,
+                                method: m.method,
+                                identityBackend: m.identity_backend,
                             });
-                            if (!criminal) continue;
-
-                            const faceMatch = await prisma.faceMatch.create({
-                                data: {
-                                    criminalId: criminal.id,
-                                    detectionId: record.id,
-                                    detectionSource: 'CCTV',
-                                    confidence: m.confidence,
-                                    latitude,
-                                    longitude,
-                                },
-                            });
-
-                            if (io) {
-                                io.emit('criminal:matched', {
-                                    matchId: faceMatch.id,
-                                    criminalName: criminal.name,
-                                    firNumber: criminal.firNumber,
-                                    confidence: m.confidence,
-                                    latitude,
-                                    longitude,
-                                    source: 'CCTV',
-                                    mugshotUrl: criminal.mugshotUrl
-                                });
-                            }
                         }
                     }
                 }
@@ -332,6 +390,7 @@ router.post('/criminal-db', authenticate, requireRole('LAW_ENFORCEMENT', 'ADMIN'
                 addedById: (req as any).user?.userId || null,
             },
         });
+        await storeIdentityEmbeddings(record.id, pipelineResult.criminal?.identity_embeddings, { replace: true });
 
         res.status(201).json({ criminal: record });
     } catch (error) {
@@ -422,7 +481,7 @@ router.delete('/criminal-db/:id', authenticate, requireRole('LAW_ENFORCEMENT', '
             }
         }
 
-        // Always enforce delete-by-name in pipeline for LBPH/face_samples registrations.
+        // Always enforce delete-by-name in pipeline for sample-store consistency.
         try {
             const respByName = await fetch(
                 `${CCTV_PIPELINE_URL}/criminal-db/by-name/${encodeURIComponent(criminal.name)}`,
@@ -453,6 +512,7 @@ router.delete('/criminal-db/:id', authenticate, requireRole('LAW_ENFORCEMENT', '
 
         // Also delete face matches to maintain integrity if onDelete Cascade isn't set
         await prisma.faceMatch.deleteMany({ where: { criminalId: id } });
+        await removeIdentityEmbeddings(id);
         await prisma.criminalRecord.delete({ where: { id } });
         await syncPipelineSubjectsWithDb();
         res.json({ success: true });
@@ -545,27 +605,19 @@ router.post('/detections/:id/match', authenticate, requireRole('MODERATOR', 'LAW
             return res.status(404).json({ error: 'Detection crop file not found' });
         }
 
-        let matchResult: any;
+        let matches: Awaited<ReturnType<typeof matchFileWithPgvector>>;
         try {
-            matchResult = await forwardFileToPipeline(cropPath, '/match-face', {
-                threshold: req.body.threshold || '0.65',
-            });
+            matches = await matchFileWithPgvector(cropPath, Number(req.body.threshold || '0.65'));
         } catch (err: any) {
             return res.status(502).json({ error: 'Pipeline unavailable', details: err?.message });
         }
 
         // Store matches in DB
         const stored = [];
-        for (const m of matchResult.matches || []) {
-            // Find the criminal record by embeddingId
-            const criminal = await prisma.criminalRecord.findFirst({
-                where: { embeddingId: m.criminal_id },
-            });
-            if (!criminal) continue;
-
+        for (const m of matches) {
             const faceMatch = await prisma.faceMatch.create({
                 data: {
-                    criminalId: criminal.id,
+                    criminalId: m.criminalId,
                     detectionId: detection.id,
                     detectionSource: 'CCTV',
                     confidence: m.confidence,
@@ -615,22 +667,20 @@ router.post('/suspect-reviews/:id/submit-for-matching', authenticate, requireRol
             return res.status(404).json({ error: 'Isolated photo file not found' });
         }
 
-        let matchResult: any;
+        let matches: Awaited<ReturnType<typeof matchFileWithPgvector>>;
         try {
-            matchResult = await forwardFileToPipeline(review.isolatedPath, '/match-face', {
-                threshold: '0.65',
-            });
+            matches = await matchFileWithPgvector(review.isolatedPath, 0.65);
         } catch (err: any) {
             return res.status(502).json({ error: 'Pipeline unavailable', details: err?.message });
         }
 
-        const hasMatches = (matchResult.matches || []).length > 0;
+        const hasMatches = matches.length > 0;
 
         const updated = await prisma.suspectPhotoReview.update({
             where: { id },
             data: {
                 status: hasMatches ? 'MATCHED' : 'NO_MATCH',
-                matchResults: JSON.stringify(matchResult.matches || []),
+                matchResults: JSON.stringify(matches),
                 reviewedById: (req as any).user?.userId,
                 reviewedAt: new Date(),
             },
@@ -638,15 +688,10 @@ router.post('/suspect-reviews/:id/submit-for-matching', authenticate, requireRol
 
         // If matches found, create FaceMatch records
         if (hasMatches) {
-            for (const m of matchResult.matches) {
-                const criminal = await prisma.criminalRecord.findFirst({
-                    where: { embeddingId: m.criminal_id },
-                });
-                if (!criminal) continue;
-
+            for (const m of matches) {
                 await prisma.faceMatch.create({
                     data: {
-                        criminalId: criminal.id,
+                        criminalId: m.criminalId,
                         detectionSource: 'CITIZEN_PHOTO',
                         confidence: m.confidence,
                     },
@@ -654,7 +699,7 @@ router.post('/suspect-reviews/:id/submit-for-matching', authenticate, requireRol
             }
         }
 
-        res.json({ review: updated, matches: matchResult.matches || [] });
+        res.json({ review: updated, matches });
     } catch (error) {
         console.error(error);
         res.status(500).json({ error: 'Failed to submit for matching' });
@@ -788,6 +833,7 @@ router.post('/register-criminal-samples', authenticate, requireRole('LAW_ENFORCE
                 where: { id: record.id },
                 data: {
                     sampleCount: Number(registration?.sample_count ?? record.sampleCount),
+                    embeddingId: registration?.embedding_id || record.embeddingId,
                     notes: notes || record.notes,
                 },
             });
@@ -799,10 +845,12 @@ router.post('/register-criminal-samples', authenticate, requireRole('LAW_ENFORCE
                     mugshotUrl,
                     notes: notes || null,
                     sampleCount: registration?.sample_count || 0,
+                    embeddingId: registration?.embedding_id || null,
                     addedById: (req as any).user?.userId || null,
                 },
             });
         }
+        await storeIdentityEmbeddings(record.id, registration?.identity_embeddings, { replace: true });
 
         res.status(201).json({ criminal: record, registration });
     } catch (error) {
@@ -841,14 +889,181 @@ router.post('/criminal-db/:id/add-samples', authenticate, requireRole('LAW_ENFOR
         const sampleCount = Number((data as any)?.registration?.sample_count ?? criminal.sampleCount);
         const updated = await prisma.criminalRecord.update({
             where: { id: criminal.id },
-            data: { sampleCount },
+            data: {
+                sampleCount,
+                embeddingId: (data as any)?.registration?.embedding_id || criminal.embeddingId,
+            },
         });
+        await storeIdentityEmbeddings(updated.id, (data as any)?.registration?.identity_embeddings, { replace: true });
         res.json({ criminal: updated, registration: (data as any)?.registration ?? null });
     } catch (error) {
         console.error(error);
         res.status(500).json({ error: 'Failed to add samples' });
     }
 });
+
+/**
+ * Shared post-recognition enrichment: vector match against the criminals DB,
+ * dedup-aware FaceMatch creation, criminal:matched alerts and notifications.
+ *
+ * Used by both the HTTP route below and the WebSocket bridge in
+ * services/cctvStream + index.ts.
+ */
+export interface ProcessRecognitionInput {
+    pipelineResult: any;
+    frameSnapshotUrl: string | null;
+    cameraLat: number | null;
+    cameraLng: number | null;
+    /** When set (e.g. WebSocket CCTV), FaceMatch / alerts use multi-frame confirmation. */
+    cameraId?: string | null;
+}
+
+export async function processRecognitionResult(input: ProcessRecognitionInput) {
+    const { pipelineResult, frameSnapshotUrl, cameraLat, cameraLng, cameraId } = input;
+    const hasValidLocation = cameraLat != null && !isNaN(cameraLat) && cameraLng != null && !isNaN(cameraLng);
+
+    const activeCriminals = await prisma.criminalRecord.findMany({
+        select: { id: true, name: true, firNumber: true, mugshotUrl: true },
+    });
+    const criminalsByNorm = new Map<string, (typeof activeCriminals)[number]>();
+    const criminalsById = new Map<string, (typeof activeCriminals)[number]>();
+    for (const c of activeCriminals) {
+        criminalsByNorm.set(normalizeSubjectName(c.name), c);
+        criminalsById.set(c.id, c);
+    }
+
+    const normalizedFaces: any[] = [];
+    for (const f of Array.isArray((pipelineResult as any)?.faces) ? (pipelineResult as any).faces : []) {
+        const cleanFace = stripIdentityEmbeddings(f as any);
+        const alertEligible = Boolean((f as any)?.alert_eligible);
+        const vectorMatches = await matchIdentityEmbeddings((f as any)?.identity_embeddings, { faceThreshold: 0.65 });
+        const best = vectorMatches[0];
+        if (best) {
+            normalizedFaces.push({
+                ...cleanFace,
+                name: best.name,
+                confidence: best.confidence,
+                is_match: true,
+                method: best.method,
+                identity_backend: best.identity_backend,
+                criminalId: best.criminalId,
+                alert_eligible: alertEligible,
+            });
+        } else {
+            normalizedFaces.push({
+                ...cleanFace,
+                name: 'Unknown',
+                confidence: normalizeLiveConfidence(cleanFace?.confidence),
+                is_match: false,
+                alert_eligible: alertEligible,
+            });
+        }
+    }
+    const normalizedMatches = normalizedFaces.filter((f: any) => f?.is_match);
+
+    const matchResults = normalizedMatches.length > 0 ? normalizedMatches : ((pipelineResult as any)?.matches || []);
+    if (matchResults.length > 0) {
+        const { io } = await import('../index');
+
+        for (const m of matchResults) {
+            const criminal = criminalsById.get(String(m?.criminalId ?? '')) ||
+                criminalsByNorm.get(normalizeSubjectName(String(m?.name ?? '')));
+            if (!criminal) continue;
+
+            const normalizedConfidence = Number(m.confidence) >= 0 && Number(m.confidence) <= 1
+                ? Number(m.confidence)
+                : normalizeLiveConfidence(m.confidence);
+            const recentMatches = await prisma.faceMatch.findMany({
+                where: {
+                    criminalId: criminal.id,
+                    detectionSource: 'CCTV',
+                    createdAt: { gte: new Date(Date.now() - LIVE_DEDUP_WINDOW_MS) },
+                },
+                select: { id: true, latitude: true, longitude: true },
+            });
+            const duplicateAtSameLocation = recentMatches.some((rm) => {
+                if (!hasValidLocation) return true;
+                if (rm.latitude == null || rm.longitude == null) return true;
+                return (
+                    Math.abs(rm.latitude - cameraLat!) <= SAME_LOCATION_EPSILON &&
+                    Math.abs(rm.longitude - cameraLng!) <= SAME_LOCATION_EPSILON
+                );
+            });
+            if (duplicateAtSameLocation) continue;
+
+            const trackId = (m as any)?.track_id ?? (m as any)?.motion_track_id;
+            const useLiveAlertGate = Boolean(cameraId && trackId != null && trackId !== '');
+            const alertEligible = Boolean((m as any)?.alert_eligible);
+            if (
+                useLiveAlertGate &&
+                !tryConfirmLiveAlert(String(cameraId), trackId, criminal.id, normalizedConfidence, alertEligible)
+            ) {
+                continue;
+            }
+
+            const faceMatch = await prisma.faceMatch.create({
+                data: {
+                    criminalId: criminal.id,
+                    detectionSource: 'CCTV',
+                    confidence: normalizedConfidence,
+                    spottedAt: new Date(),
+                    latitude: hasValidLocation ? cameraLat : null,
+                    longitude: hasValidLocation ? cameraLng : null,
+                    frameSnapshot: frameSnapshotUrl,
+                },
+            });
+
+            if (io) {
+                io.emit('criminal:matched', {
+                    matchId: faceMatch.id,
+                    criminalName: criminal.name,
+                    firNumber: criminal.firNumber,
+                    confidence: faceMatch.confidence,
+                    source: 'LIVE_SURVEILLANCE',
+                    mugshotUrl: criminal.mugshotUrl,
+                    frameSnapshot: faceMatch.frameSnapshot,
+                    spottedAt: faceMatch.spottedAt,
+                    latitude: hasValidLocation ? cameraLat : null,
+                    longitude: hasValidLocation ? cameraLng : null,
+                    method: m.method,
+                    identityBackend: m.identity_backend,
+                });
+            }
+
+            try {
+                const locationStr = hasValidLocation
+                    ? ` at location (${cameraLat!.toFixed(4)}, ${cameraLng!.toFixed(4)})`
+                    : '';
+                const lawEnforcementUsers = await prisma.user.findMany({
+                    where: { role: { in: ['LAW_ENFORCEMENT', 'ADMIN'] } },
+                    select: { id: true },
+                });
+                for (const u of lawEnforcementUsers) {
+                    await prisma.notification.create({
+                        data: {
+                            userId: u.id,
+                            message: `Criminal "${criminal.name}" (FIR: ${criminal.firNumber || 'N/A'}) identified in live surveillance with ${(faceMatch.confidence * 100).toFixed(0)}% confidence${locationStr}.`,
+                            type: 'GENERAL',
+                        },
+                    });
+                }
+            } catch (notifErr) {
+                console.warn('[CCTV] Failed to create match notifications', notifErr);
+            }
+        }
+    }
+
+    return {
+        ...(pipelineResult as any),
+        faces: normalizedFaces,
+        matches: normalizedMatches.length > 0
+            ? normalizedMatches
+            : (((pipelineResult as any)?.matches || []).map((m: any) => stripIdentityEmbeddings({
+                ...m,
+                confidence: normalizeLiveConfidence(m?.confidence),
+            }))),
+    };
+}
 
 router.post('/recognize-frame', authenticate, requireRole('MODERATOR', 'LAW_ENFORCEMENT', 'ADMIN'), async (req: Request, res: Response) => {
     try {
@@ -858,7 +1073,6 @@ router.post('/recognize-frame', authenticate, requireRole('MODERATOR', 'LAW_ENFO
 
         const cameraLat = camera_latitude != null ? parseFloat(String(camera_latitude)) : null;
         const cameraLng = camera_longitude != null ? parseFloat(String(camera_longitude)) : null;
-        const hasValidLocation = cameraLat != null && !isNaN(cameraLat) && cameraLng != null && !isNaN(cameraLng);
 
         // Forward to Python pipeline
         let pipelineResult: any;
@@ -877,137 +1091,20 @@ router.post('/recognize-frame', authenticate, requireRole('MODERATOR', 'LAW_ENFO
             });
         }
 
-        const activeCriminals = await prisma.criminalRecord.findMany({
-            select: { id: true, name: true, firNumber: true, mugshotUrl: true },
+        const enriched = await processRecognitionResult({
+            pipelineResult,
+            frameSnapshotUrl,
+            cameraLat,
+            cameraLng,
         });
-        const criminalsByNorm = new Map<string, (typeof activeCriminals)[number]>();
-        for (const c of activeCriminals) {
-            criminalsByNorm.set(normalizeSubjectName(c.name), c);
-        }
 
-        // If matches found, create FaceMatch records and emit WebSocket alerts
-        const matchResults = (pipelineResult as any)?.matches || [];
-        if (matchResults.length > 0) {
-            const { io } = await import('../index');
-
-            for (const m of matchResults) {
-                // Find criminal using normalized subject names (space/underscore safe).
-                const criminal = criminalsByNorm.get(normalizeSubjectName(String(m?.name ?? '')));
-                if (!criminal) continue;
-
-                // Convert LBPH distance (lower is better) to a 0..1 score for UI/notifications.
-                // Distances near threshold should be low confidence, very low distances high confidence.
-                const normalizedConfidence = normalizeLiveConfidence(m.confidence);
-                // Dedup check: skip repeated alerts for same criminal at same location in the time window.
-                const recentMatches = await prisma.faceMatch.findMany({
-                    where: {
-                        criminalId: criminal.id,
-                        detectionSource: 'CCTV',
-                        createdAt: { gte: new Date(Date.now() - LIVE_DEDUP_WINDOW_MS) },
-                    },
-                    select: { id: true, latitude: true, longitude: true },
-                });
-                const duplicateAtSameLocation = recentMatches.some((rm) => {
-                    if (!hasValidLocation) return true;
-                    if (rm.latitude == null || rm.longitude == null) return true;
-                    return (
-                        Math.abs(rm.latitude - cameraLat!) <= SAME_LOCATION_EPSILON &&
-                        Math.abs(rm.longitude - cameraLng!) <= SAME_LOCATION_EPSILON
-                    );
-                });
-                if (duplicateAtSameLocation) continue;
-
-                const faceMatch = await prisma.faceMatch.create({
-                    data: {
-                        criminalId: criminal.id,
-                        detectionSource: 'CCTV',
-                        confidence: normalizedConfidence,
-                        spottedAt: new Date(),
-                        latitude: hasValidLocation ? cameraLat : null,
-                        longitude: hasValidLocation ? cameraLng : null,
-                        frameSnapshot: frameSnapshotUrl,
-                    },
-                });
-
-                // Emit WebSocket alert
-                if (io) {
-                    io.emit('criminal:matched', {
-                        matchId: faceMatch.id,
-                        criminalName: criminal.name,
-                        firNumber: criminal.firNumber,
-                        confidence: faceMatch.confidence,
-                        source: 'LIVE_SURVEILLANCE',
-                        mugshotUrl: criminal.mugshotUrl,
-                        frameSnapshot: faceMatch.frameSnapshot,
-                        spottedAt: faceMatch.spottedAt,
-                        latitude: hasValidLocation ? cameraLat : null,
-                        longitude: hasValidLocation ? cameraLng : null,
-                    });
-                }
-
-                // Create notification for all LAW_ENFORCEMENT users
-                try {
-                    const locationStr = hasValidLocation
-                        ? ` at location (${cameraLat!.toFixed(4)}, ${cameraLng!.toFixed(4)})`
-                        : '';
-                    const lawEnforcementUsers = await prisma.user.findMany({
-                        where: { role: { in: ['LAW_ENFORCEMENT', 'ADMIN'] } },
-                        select: { id: true },
-                    });
-                    for (const u of lawEnforcementUsers) {
-                        await prisma.notification.create({
-                            data: {
-                                userId: u.id,
-                                message: `Criminal "${criminal.name}" (FIR: ${criminal.firNumber || 'N/A'}) identified in live surveillance with ${(faceMatch.confidence * 100).toFixed(0)}% confidence${locationStr}.`,
-                                type: 'GENERAL',
-                            },
-                        });
-                    }
-                } catch (notifErr) {
-                    console.warn('[CCTV] Failed to create match notifications', notifErr);
-                }
-            }
-        }
-
-        // Guardrail: only allow identities that still exist in Criminal DB.
-        // This prevents stale pipeline subjects (e.g., deleted records not yet purged) from appearing in UI.
-        const activeNamesNorm = new Set(activeCriminals.map((c) => normalizeSubjectName(c.name)));
-
-        const normalizedFaces = Array.isArray((pipelineResult as any)?.faces)
-            ? (pipelineResult as any).faces.map((f: any) => {
-                  const normalized = {
-                      ...f,
-                      confidence: normalizeLiveConfidence(f?.confidence),
-                  };
-                  if (normalized?.is_match && !activeNamesNorm.has(normalizeSubjectName(String(normalized?.name ?? '')))) {
-                      return {
-                          ...normalized,
-                          name: 'Unknown',
-                          is_match: false,
-                      };
-                  }
-                  return normalized;
-              })
-            : [];
-        const normalizedMatches = Array.isArray((pipelineResult as any)?.matches)
-            ? (pipelineResult as any).matches
-                  .map((m: any) => ({
-                      ...m,
-                      confidence: normalizeLiveConfidence(m?.confidence),
-                  }))
-                  .filter((m: any) => activeNamesNorm.has(normalizeSubjectName(String(m?.name ?? ''))))
-            : [];
-
-        res.json({
-            ...(pipelineResult as any),
-            faces: normalizedFaces,
-            matches: normalizedMatches,
-        });
+        return res.json(enriched);
     } catch (error) {
         console.error(error);
         res.status(500).json({ error: 'Failed to process recognition frame' });
     }
 });
+
 
 router.get('/intelligence-feed', authenticate, requireRole('LAW_ENFORCEMENT', 'ADMIN'), async (req: Request, res: Response) => {
     try {

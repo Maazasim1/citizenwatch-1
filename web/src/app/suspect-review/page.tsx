@@ -4,8 +4,8 @@ import { useEffect, useState } from 'react';
 import { UserSearch, ShieldCheck, Send, Archive, Eye, AlertTriangle, CheckCircle } from 'lucide-react';
 import Navbar from '../../components/Navbar';
 import { useAuth } from '../../context/AuthContext';
-
-const API = process.env.NEXT_PUBLIC_API_BASE_URL || 'http://localhost:3001';
+import { getApiBaseUrl } from '@/lib/apiBase';
+import { authFetch } from '@/lib/authFetch';
 
 interface SuspectReview {
     id: string;
@@ -45,12 +45,11 @@ export default function SuspectReviewPage() {
     const [submitting, setSubmitting] = useState(false);
 
     const canAccess = user?.role === 'MODERATOR' || user?.role === 'LAW_ENFORCEMENT' || user?.role === 'ADMIN';
-    const headers = { Authorization: `Bearer ${token}` };
 
     const fetchReviews = async () => {
         setLoading(true);
         try {
-            const res = await fetch(`${API}/api/cctv/suspect-reviews`, { headers });
+            const res = await authFetch(`${getApiBaseUrl()}/api/cctv/suspect-reviews`, {}, token);
             const data = await res.json();
             if (data.reviews) setReviews(data.reviews);
         } catch (e) { console.error(e); }
@@ -65,10 +64,7 @@ export default function SuspectReviewPage() {
     const handleSubmitForMatching = async (reviewId: string) => {
         setSubmitting(true);
         try {
-            const res = await fetch(`${API}/api/cctv/suspect-reviews/${reviewId}/submit-for-matching`, {
-                method: 'POST',
-                headers,
-            });
+            const res = await authFetch(`${getApiBaseUrl()}/api/cctv/suspect-reviews/${reviewId}/submit-for-matching`, { method: 'POST' }, token);
             const data = await res.json();
             if (res.ok) {
                 fetchReviews();
@@ -84,10 +80,7 @@ export default function SuspectReviewPage() {
 
     const handleArchive = async (reviewId: string) => {
         try {
-            await fetch(`${API}/api/cctv/suspect-reviews/${reviewId}/archive`, {
-                method: 'POST',
-                headers,
-            });
+            await authFetch(`${getApiBaseUrl()}/api/cctv/suspect-reviews/${reviewId}/archive`, { method: 'POST' }, token);
             fetchReviews();
             setSelected(null);
         } catch (e) { console.error(e); }

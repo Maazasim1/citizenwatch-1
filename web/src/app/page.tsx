@@ -6,7 +6,7 @@ import dynamic from 'next/dynamic';
 import { io, Socket } from 'socket.io-client';
 import Navbar from '../components/Navbar';
 import type { HotspotCluster } from '../components/MapComponent';
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL || 'http://localhost:3001';
+import { getApiBaseUrl } from '@/lib/apiBase';
 
 const MapComponent = dynamic(() => import('../components/MapComponent'), {
     ssr: false,
@@ -52,8 +52,8 @@ export default function Home() {
 
         try {
             const [repRes, hotRes] = await Promise.all([
-                fetch(`${API_BASE}/api/reports?${params.toString()}`),
-                fetch(`${API_BASE}/api/hotspots?${params.toString()}`),
+                fetch(`${getApiBaseUrl()}/api/reports?${params.toString()}`),
+                fetch(`${getApiBaseUrl()}/api/hotspots?${params.toString()}`),
             ]);
 
             if (!repRes.ok) {
@@ -84,7 +84,7 @@ export default function Home() {
     }, [loadMapData]);
 
     useEffect(() => {
-        const socket: Socket = io(API_BASE);
+        const socket: Socket = io(getApiBaseUrl());
 
         socket.on('report:new', () => {
             void loadMapData();

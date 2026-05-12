@@ -1,7 +1,8 @@
 'use client';
 
-import { createContext, useContext, useState, useEffect, ReactNode } from 'react';
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL || 'http://localhost:3001';
+import { createContext, useContext, useState, useEffect, useCallback, ReactNode } from 'react';
+import { getApiBaseUrl } from '@/lib/apiBase';
+import { registerUnauthorizedHandler } from '@/lib/authFetch';
 
 interface User {
     id: string;
@@ -17,13 +18,14 @@ interface User {
     witnessAlertLatitude?: number | null;
     witnessAlertLongitude?: number | null;
 }
+type UserRole = 'CITIZEN' | 'MODERATOR' | 'LAW_ENFORCEMENT' | 'ADMIN';
 
 interface AuthContextType {
     user: User | null;
     token: string | null;
     loading: boolean;
     login: (credentials: { email?: string; phone?: string; password: string }) => Promise<{ error?: string, requiresOtp?: boolean, userId?: string }>;
-    register: (data: { email?: string; phone?: string; password: string }) => Promise<{ error?: string, requiresOtp?: boolean, userId?: string }>;
+    register: (data: { email?: string; phone?: string; password: string; role?: UserRole }) => Promise<{ error?: string, requiresOtp?: boolean, userId?: string }>;
     verifyOtp: (data: { userId: string; otpCode: string }) => Promise<{ error?: string }>;
     logout: () => void;
 }
@@ -56,7 +58,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
     const login = async (credentials: { email?: string; phone?: string; password: string }) => {
         try {
-            const res = await fetch(`${API_BASE}/api/auth/login`, {
+            const res = await fetch(`${getApiBaseUrl()}/api/auth/login`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(credentials),
@@ -79,9 +81,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         }
     };
 
-    const register = async (credentials: { email?: string; phone?: string; password: string }) => {
+    const register = async (credentials: { email?: string; phone?: string; password: string; role?: UserRole }) => {
         try {
-            const res = await fetch(`${API_BASE}/api/auth/register`, {
+            const res = await fetch(`${getApiBaseUrl()}/api/auth/register`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(credentials),
@@ -102,7 +104,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
     const verifyOtp = async ({ userId, otpCode }: { userId: string, otpCode: string }) => {
         try {
-            const res = await fetch(`${API_BASE}/api/auth/verify-otp`, {
+            const res = await fetch(`${getApiBaseUrl()}/api/auth/verify-otp`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ userId, otpCode }),
@@ -121,12 +123,22 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         }
     };
 
-    const logout = () => {
+    const logout = useCallback(() => {
         localStorage.removeItem('sc_token');
         localStorage.removeItem('sc_user');
         setToken(null);
         setUser(null);
-    };
+    }, []);
+
+    useEffect(() => {
+        registerUnauthorizedHandler(() => {
+            logout();
+            if (typeof window !== 'undefined' && !window.location.pathname.startsWith('/login')) {
+                window.location.href = '/login';
+            }
+        });
+        return () => registerUnauthorizedHandler(null);
+    }, [logout]);
 
     return (
         <AuthContext.Provider value={{ user, token, loading, login, register, verifyOtp, logout }}>
