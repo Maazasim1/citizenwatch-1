@@ -48,3 +48,7 @@ Thumbs.db
 # Python environments
 venv/
 .venv/
+
+# Runtime upload artifacts
+apps/api/uploads/**
+!apps/api/uploads/.gitkeep
